@@ -32,3 +32,7 @@ htmlcov/
 
 # Logs
 *.log
+
+# HuggingFace deploy
+hf_demo/
+hf_space_deploy/

@@ -13,10 +13,10 @@ import pytest
 import numpy as np
 import sys
 
-sys.path.insert(0, '.')
 
-from plugins.zeiss import LiveTracker, DriftCorrector, FiberLinker
-from plugins.zeiss.fiducial import FiducialDriftCorrector
+
+from biomatrix.plugins.zeiss import LiveTracker, DriftCorrector, FiberLinker
+from biomatrix.plugins.zeiss.fiducial import FiducialDriftCorrector
 
 
 # ============================================================

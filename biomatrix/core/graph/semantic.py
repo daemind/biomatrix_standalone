@@ -1311,9 +1311,187 @@ def solve_arc_with_global_mapping(training_pairs: List[Tuple['State', 'State']],
     return predicted, explanation
 
 
-# NOTE: Context-aware mapping with size binning was removed as it violates
-# AGENT.md principles (hardcoded thresholds). See examples/benchmark_semantic.py
-# for experimental versions. Core should use only algebraic approaches.
+def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[str, Any]:
+    """
+    Greedy detection of causal groups.
+    
+    Objects are grouped by the transformation they undergo.
+    No hardcoded thresholds - purely data-driven grouping.
+    
+    Returns:
+        groups: Dict[transformation_signature -> list of object properties]
+        transformation_map: signature -> (c_in, c_out) mapping
+    """
+    from ..topology import partition_by_connectivity
+    
+    # Collect all (object_features, transformation) pairs
+    observations = []
+    
+    for pair_idx, (s_in, s_out) in enumerate(training_pairs):
+        objs_in = partition_by_connectivity(s_in)
+        objs_out = partition_by_connectivity(s_out)
+        
+        for obj_idx, (obj_in, obj_out) in enumerate(zip(objs_in, objs_out)):
+            if obj_in.n_dims >= 3 and obj_out.n_dims >= 3:
+                c_in = float(np.round(obj_in.points[0, 2], 0))
+                c_out = float(np.round(obj_out.points[0, 2], 0))
+                
+                # Object features (N-dim agnostic)
+                features = {
+                    'n_points': obj_in.n_points,
+                    'color_in': c_in,
+                    'centroid': tuple(obj_in.centroid[:2]),
+                    'spread': float(np.std(obj_in.points[:, :2]))
+                }
+                
+                # Transformation signature
+                transform = (c_in, c_out)
+                
+                observations.append({
+                    'pair': pair_idx,
+                    'obj': obj_idx,
+                    'features': features,
+                    'transform': transform
+                })
+    
+    # Group by transformation signature (greedy clustering)
+    groups = {}
+    for obs in observations:
+        sig = obs['transform']
+        if sig not in groups:
+            groups[sig] = []
+        groups[sig].append(obs['features'])
+    
+    # Find discriminating features for each group
+    group_profiles = {}
+    for sig, feature_list in groups.items():
+        if len(feature_list) == 0:
+            continue
+        
+        # Aggregate features using vectorized ops
+        n_points_arr = np.array([f['n_points'] for f in feature_list])
+        spread_arr = np.array([f['spread'] for f in feature_list])
+        
+        group_profiles[sig] = {
+            'count': len(feature_list),
+            'n_points_range': (float(n_points_arr.min()), float(n_points_arr.max())),
+            'n_points_mean': float(n_points_arr.mean()),
+            'spread_range': (float(spread_arr.min()), float(spread_arr.max())),
+        }
+    
+    return {
+        'groups': groups,
+        'profiles': group_profiles,
+        'n_groups': len(groups)
+    }
+
+
+def match_object_to_group(obj_features: Dict, group_profiles: Dict) -> Tuple[float, float]:
+    """
+    Match an object to the best causal group based on feature similarity.
+    
+    Uses algebraic distance in feature space, no thresholds.
+    Returns the transformation (c_in, c_out) for the best matching group.
+    """
+    if not group_profiles:
+        return None
+    
+    best_sig = None
+    best_score = float('inf')
+    
+    obj_n = obj_features['n_points']
+    obj_spread = obj_features['spread']
+    obj_color = obj_features['color_in']
+    
+    for sig, profile in group_profiles.items():
+        # Only consider groups with matching input color
+        if sig[0] != obj_color:
+            continue
+        
+        # Compute distance in feature space (normalized)
+        n_mean = profile['n_points_mean']
+        n_range = profile['n_points_range']
+        
+        # Distance as deviation from group mean (relative)
+        n_dev = abs(obj_n - n_mean) / max(n_mean, 1)
+        
+        # Score: lower is better
+        score = n_dev
+        
+        if score < best_score:
+            best_score = score
+            best_sig = sig
+    
+    return best_sig
+
+
+def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
+                                  test_input: 'State') -> Tuple['State', str]:
+    """
+    Solve ARC using greedy causal group detection.
+    
+    1. Detect causal groups from training (objects with same transform)
+    2. Profile each group's features
+    3. Match test objects to groups
+    4. Apply corresponding transformation
+    """
+    from ..topology import partition_by_connectivity
+    from ..state import State
+    
+    # Detect groups
+    detected = detect_causal_groups(training_pairs)
+    profiles = detected['profiles']
+    
+    # Partition test
+    test_objs = partition_by_connectivity(test_input)
+    
+    result_points = test_input.points.copy()
+    
+    # Track which points belong to which object
+    point_idx = 0
+    applied = []
+    
+    for obj in test_objs:
+        if obj.n_dims >= 3:
+            c_in = float(np.round(obj.points[0, 2], 0))
+            
+            obj_features = {
+                'n_points': obj.n_points,
+                'color_in': c_in,
+                'spread': float(np.std(obj.points[:, :2]))
+            }
+            
+            # Match to group
+            matched_sig = match_object_to_group(obj_features, profiles)
+            
+            if matched_sig:
+                c_out = matched_sig[1]
+                # Apply transformation to all points of this object
+                for pt in obj.points:
+                    # Find this point in result_points
+                    mask = np.all(np.isclose(result_points[:, :2], pt[:2]), axis=1)
+                    result_points[mask, 2] = c_out
+                
+                applied.append((c_in, c_out, obj.n_points))
+        
+        point_idx += obj.n_points
+    
+    predicted = State(result_points)
+    
+    # Explanation
+    lines = ["=" * 60]
+    lines.append("CAUSAL GROUP SOLUTION")
+    lines.append("=" * 60)
+    lines.append(f"\nDetected {detected['n_groups']} causal groups:")
+    for sig, profile in profiles.items():
+        lines.append(f"  {int(sig[0])}→{int(sig[1])}: {profile['count']} objects, "
+                     f"n_points={profile['n_points_range']}")
+    lines.append("\nApplied to test:")
+    for c_in, c_out, n in applied:
+        lines.append(f"  {int(c_in)}→{int(c_out)} (n={n})")
+    lines.append("=" * 60)
+    
+    return predicted, "\n".join(lines)
 
 
 # Export
@@ -1326,5 +1504,6 @@ __all__ = [
     'SemanticRule', 'derive_semantic_rules', 'explain_semantic_resolution',
     'apply_semantic_rules', 'solve_arc_semantically',
     'unify_rules_across_pairs', 'explain_cross_pair_generalization',
-    'learn_global_mapping', 'solve_arc_with_global_mapping'
+    'learn_global_mapping', 'solve_arc_with_global_mapping',
+    'detect_causal_groups', 'solve_arc_with_causal_groups'
 ]

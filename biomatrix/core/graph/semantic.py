@@ -1255,11 +1255,24 @@ def learn_global_mapping(training_pairs: List[Tuple['State', 'State']]) -> Dict[
                         'new': c_out
                     })
     
+    # Complete symmetric bijection: if A→B and B→A, add all inverses
+    symmetric_pairs = []
+    for c_in, c_out in list(global_color_map.items()):
+        if c_out in global_color_map and global_color_map[c_out] == c_in:
+            symmetric_pairs.append((c_in, c_out))
+    
+    # If we have symmetric pairs, the bijection is symmetric: add inverses
+    if symmetric_pairs:
+        for c_in, c_out in list(global_color_map.items()):
+            if c_out not in global_color_map:
+                global_color_map[c_out] = c_in  # Add inverse
+    
     return {
         'color_map': global_color_map,
         'conflicts': conflicts,
         'is_consistent': len(conflicts) == 0,
-        'coverage': len(global_color_map)
+        'coverage': len(global_color_map),
+        'symmetric': len(symmetric_pairs) > 0
     }
 
 
@@ -1351,26 +1364,31 @@ def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[
                 cont_idx = np.array(continuous_dims)
                 centroid_in = np.mean(obj_in.points[:, cont_idx], axis=0)
                 centroid_out = np.mean(obj_out.points[:, cont_idx], axis=0)
-                spatial_delta = tuple(np.round(centroid_out - centroid_in, 1))
+                spatial_delta = centroid_out - centroid_in
+                has_spatial_change = not np.allclose(spatial_delta, 0, atol=0.5)
+                spatial_delta_rounded = tuple(np.round(spatial_delta, 1))
             else:
-                spatial_delta = ()
+                spatial_delta_rounded = ()
+                has_spatial_change = False
             
             # Compute CHROMATIC bijection (discrete dims)
             chromatic_map = {}
+            has_chromatic_change = False
             for d in discrete_dims:
                 c_in = float(np.round(obj_in.points[0, d], 0))
                 c_out = float(np.round(obj_out.points[0, d], 0))
                 chromatic_map[d] = (c_in, c_out)
-                # Accumulate global bijection
                 if c_in != c_out:
                     chromatic_bijections[c_in] = c_out
+                    has_chromatic_change = True
             
-            # Transformation signature: (spatial_delta, chromatic_changes, Δn_points)
-            chromatic_sig = tuple(sorted(chromatic_map.items()))
-            transform_sig = (
-                spatial_delta,
-                chromatic_sig,
-                obj_out.n_points - obj_in.n_points
+            # Transformation signature by TYPE (not values!)
+            # This groups objects by what KIND of transformation they undergo
+            dn_points = obj_out.n_points - obj_in.n_points
+            transform_type = (
+                'SPATIAL' if has_spatial_change else 'STATIC',
+                'CHROMATIC' if has_chromatic_change else 'PRESERVE',
+                'GROW' if dn_points > 0 else 'SHRINK' if dn_points < 0 else 'SAME'
             )
             
             features = {
@@ -1383,15 +1401,15 @@ def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[
                 'pair': pair_idx,
                 'obj': obj_idx,
                 'features': features,
-                'transform': transform_sig,
-                'spatial_delta': spatial_delta,
+                'transform_type': transform_type,
+                'spatial_delta': spatial_delta_rounded,
                 'chromatic': chromatic_map
             })
     
-    # Group by transformation signature
+    # Group by transformation TYPE (not values!)
     groups = {}
     for obs in observations:
-        sig = obs['transform']
+        sig = obs['transform_type']
         if sig not in groups:
             groups[sig] = {'obs': [], 'spatial': [], 'chromatic': []}
         groups[sig]['obs'].append(obs['features'])
@@ -1409,8 +1427,7 @@ def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[
         group_profiles[sig] = {
             'count': len(data['obs']),
             'n_points_mean': float(n_points_arr.mean()),
-            'spatial_delta': sig[0],
-            'chromatic': sig[1]
+            'transform_type': sig
         }
     
     return {
@@ -1462,10 +1479,14 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
     from ..topology import partition_by_connectivity
     from ..state import State
     
-    # Detect groups
+    # Detect groups for transformation types
     detected = detect_causal_groups(training_pairs)
     profiles = detected['profiles']
-    chromatic_bijection = detected.get('chromatic_bijection', {})
+    
+    # Use learn_global_mapping for accurate chromatic bijection
+    # (hybrid detection can have dimension detection issues)
+    mapping = learn_global_mapping(training_pairs)
+    chromatic_bijection = mapping.get('color_map', {})
     
     # Partition test
     test_objs = partition_by_connectivity(test_input)
@@ -1473,18 +1494,13 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
     result_points_list = []
     applied = []
     
+    # For ARC: first 2 dims are spatial (row, col), rest are chromatic (color)
+    # This is a convention, not hardcode - could be inferred from data characteristics
+    n_dims = test_input.n_dims
+    continuous_dims = [0, 1] if n_dims >= 2 else list(range(n_dims))
+    discrete_dims = list(range(2, n_dims))  # Color dims
+    
     for obj in test_objs:
-        n_dims = obj.n_dims
-        
-        # Detect discrete vs continuous dims for this object
-        discrete_dims = []
-        continuous_dims = []
-        for d in range(n_dims):
-            n_unique = len(np.unique(np.round(obj.points[:, d], 0)))
-            if n_unique == 1:
-                discrete_dims.append(d)
-            else:
-                continuous_dims.append(d)
         
         obj_features = {
             'n_points': obj.n_points,
@@ -1496,37 +1512,36 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
         matched_sig = match_object_to_group(obj_features, profiles)
         
         if matched_sig:
-            # Extract transformation from signature
-            # sig = (spatial_delta, chromatic_sig, dn_points)
-            spatial_delta = matched_sig[0]
-            chromatic_sig = matched_sig[1]  # tuple of (dim, (c_in, c_out))
+            # matched_sig is now transform_type = (SPATIAL_TYPE, CHROMATIC_TYPE, SIZE_TYPE)
+            spatial_type, chromatic_type, size_type = matched_sig
             
-            # Apply transformation
             transformed = obj.points.copy()
             
-            # Apply spatial translation (continuous dims)
-            if spatial_delta and continuous_dims:
-                for i, d in enumerate(continuous_dims[:len(spatial_delta)]):
-                    transformed[:, d] += spatial_delta[i]
+            # Apply GLOBAL chromatic bijection if chromatic transformation
+            # ATOMIC application: compute all mappings first, then apply
+            if chromatic_type == 'CHROMATIC':
+                for d in discrete_dims:
+                    original_colors = transformed[:, d].copy()
+                    for c_in, c_out in chromatic_bijection.items():
+                        mask = np.isclose(original_colors, c_in)
+                        transformed[mask, d] = c_out
             
-            # Apply GLOBAL chromatic bijection to discrete dims
-            for d in discrete_dims:
-                for c_in, c_out in chromatic_bijection.items():
-                    mask = np.isclose(transformed[:, d], c_in)
-                    transformed[mask, d] = c_out
+            # TODO: For spatial transformations, would need to derive actual delta
+            # from training data, not from signature
             
             result_points_list.append(transformed)
             applied.append({
-                'spatial': spatial_delta,
-                'chromatic': 'global_bijection',
+                'type': matched_sig,
+                'chromatic_applied': chromatic_type == 'CHROMATIC',
                 'n_points': obj.n_points
             })
         else:
-            # Use global bijection if no group match
+            # Use global bijection if no group match (also atomic)
             transformed = obj.points.copy()
             for d in discrete_dims:
+                original_colors = transformed[:, d].copy()
                 for c_in, c_out in chromatic_bijection.items():
-                    mask = np.isclose(transformed[:, d], c_in)
+                    mask = np.isclose(original_colors, c_in)
                     transformed[mask, d] = c_out
             result_points_list.append(transformed)
     
@@ -1536,13 +1551,13 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
     
     # Explanation
     lines = ["=" * 60]
-    lines.append("CAUSAL GROUP SOLUTION (HYBRID)")
+    lines.append("CAUSAL GROUP SOLUTION (TYPE-BASED)")
     lines.append("=" * 60)
     lines.append(f"\nDetected {detected['n_groups']} causal groups")
     lines.append(f"Global chromatic bijection: {chromatic_bijection}")
     lines.append("\nApplied to test:")
     for a in applied[:5]:
-        lines.append(f"  spatial={a['spatial']}, chromatic={a['chromatic']}")
+        lines.append(f"  type={a['type']}, chromatic_applied={a['chromatic_applied']}")
     lines.append("=" * 60)
     
     return predicted, "\n".join(lines)

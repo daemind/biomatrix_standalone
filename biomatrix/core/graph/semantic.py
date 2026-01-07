@@ -2462,7 +2462,13 @@ def solve_with_affine_composition(training_pairs: List[Tuple['State', 'State']],
                     
                     if idx_a < len(test_components) and idx_b < len(test_components):
                         comp_a = test_components[idx_a]
-                        comp_b = test_components[idx_b]
+                        comp_b_pts = test_components[idx_b].points.copy()
+                        
+                        # Normalize comp_b to same origin as comp_a
+                        a_min = comp_a.points[:, :2].min(axis=0)
+                        b_min = comp_b_pts[:, :2].min(axis=0)
+                        comp_b_pts[:, :2] -= (b_min - a_min)
+                        comp_b = State(comp_b_pts)
                         
                         set_op = BinarySetOperator(
                             operation=set_info['operation'],
@@ -2589,6 +2595,9 @@ def solve_with_affine_composition(training_pairs: List[Tuple['State', 'State']],
                 new_points = test_input.points @ A.T + b
             
             all_points.append(new_points)
+        
+        if not all_points:
+            return test_input, "No transforms applied"
         
         combined = np.vstack(all_points)
         predicted = State(combined)

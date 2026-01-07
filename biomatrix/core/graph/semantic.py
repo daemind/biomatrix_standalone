@@ -609,10 +609,144 @@ def build_scene_graph(state: 'State', grid_shape: Tuple[int, int] = None) -> Sem
     return graph
 
 
+def explain_scene(graph: SemanticGraph) -> str:
+    """
+    Generate natural language description of a scene.
+    """
+    lines = []
+    
+    # Count objects
+    objects = [c for c in graph.concepts if c.startswith("obj_") and "." not in c]
+    lines.append(f"The scene contains {len(objects)} object(s).")
+    
+    # Describe each object
+    for obj_name in objects:
+        obj = graph.concepts.get(obj_name)
+        if obj and obj.value:
+            ctx = obj.value.get('context', 'unknown')
+            pattern = obj.value.get('pattern', 'unknown')
+            n_pts = obj.value.get('n_points', 0)
+            
+            desc = f"  • {obj_name}: A {pattern}"
+            if ctx == 'corner':
+                desc += " in the corner"
+            elif ctx == 'edge':
+                desc += " on the edge"
+            elif ctx == 'interior':
+                desc += " in the interior"
+            desc += f" ({n_pts} points)"
+            lines.append(desc)
+    
+    # Describe relations
+    if graph.relations:
+        lines.append("\nSpatial relations:")
+        for r in graph.relations[:10]:
+            rel_name = r.rtype.name.lower().replace('_', ' ')
+            lines.append(f"  • {r.source} is {rel_name} {r.target}")
+    
+    return "\n".join(lines)
+
+
+def explain_transformation(graph_in: SemanticGraph, graph_out: SemanticGraph, 
+                          operator: 'Operator' = None) -> str:
+    """
+    Generate natural language explanation of a transformation.
+    
+    This is the key for ARC explainability:
+    - What changed?
+    - What stayed the same?
+    - What's the rule?
+    """
+    lines = ["=== Transformation Explanation ===\n"]
+    
+    # Object counts
+    objs_in = [c for c in graph_in.concepts if c.startswith("obj_") and "." not in c]
+    objs_out = [c for c in graph_out.concepts if c.startswith("obj_") and "." not in c]
+    
+    lines.append(f"INPUT: {len(objs_in)} object(s)")
+    lines.append(f"OUTPUT: {len(objs_out)} object(s)")
+    
+    # Mass change
+    if len(objs_out) > len(objs_in):
+        lines.append(f"  → Objects ADDED ({len(objs_out) - len(objs_in)} new)")
+    elif len(objs_out) < len(objs_in):
+        lines.append(f"  → Objects REMOVED ({len(objs_in) - len(objs_out)} deleted)")
+    else:
+        lines.append("  → Object count PRESERVED")
+    
+    # Pattern changes
+    lines.append("\nPattern Analysis:")
+    patterns_in = [graph_in.concepts.get(o).value.get('pattern') for o in objs_in 
+                   if graph_in.concepts.get(o) and graph_in.concepts.get(o).value]
+    patterns_out = [graph_out.concepts.get(o).value.get('pattern') for o in objs_out 
+                    if graph_out.concepts.get(o) and graph_out.concepts.get(o).value]
+    
+    if patterns_in == patterns_out:
+        lines.append("  • Pattern types PRESERVED")
+    else:
+        lines.append(f"  • Input patterns: {patterns_in}")
+        lines.append(f"  • Output patterns: {patterns_out}")
+    
+    # Context changes
+    contexts_in = [graph_in.concepts.get(o).value.get('context') for o in objs_in 
+                   if graph_in.concepts.get(o) and graph_in.concepts.get(o).value]
+    contexts_out = [graph_out.concepts.get(o).value.get('context') for o in objs_out 
+                    if graph_out.concepts.get(o) and graph_out.concepts.get(o).value]
+    
+    if contexts_in != contexts_out:
+        lines.append(f"  • Context changed: {contexts_in} → {contexts_out}")
+    
+    # Operator description
+    if operator:
+        lines.append("\nOperator:")
+        if hasattr(operator, 'to_symbolic'):
+            lines.append(f"  • {operator.to_symbolic()}")
+        else:
+            lines.append(f"  • {type(operator).__name__}")
+    
+    # Infer rule type
+    lines.append("\nInferred Rule:")
+    if len(objs_out) == 2 * len(objs_in):
+        lines.append("  → DUPLICATION/TILING: Objects are copied")
+    elif len(objs_out) == len(objs_in) and patterns_in == patterns_out:
+        lines.append("  → TRANSFORMATION: Objects moved/rotated but preserved")
+    elif len(objs_out) < len(objs_in):
+        lines.append("  → FILTERING: Some objects removed based on criteria")
+    elif patterns_in != patterns_out:
+        lines.append("  → RESHAPE: Object patterns modified")
+    else:
+        lines.append("  → COMPLEX: Multiple operations combined")
+    
+    return "\n".join(lines)
+
+
+def explain_arc_solution(s_in: 'State', s_out: 'State', operator: 'Operator' = None,
+                         grid_shape: Tuple[int, int] = None) -> str:
+    """
+    Full explainability pipeline for an ARC solution.
+    """
+    # Build scene graphs
+    graph_in = build_scene_graph(s_in, grid_shape)
+    graph_out = build_scene_graph(s_out, grid_shape)
+    
+    lines = ["=" * 50]
+    lines.append("INPUT SCENE:")
+    lines.append(explain_scene(graph_in))
+    lines.append("")
+    lines.append("OUTPUT SCENE:")
+    lines.append(explain_scene(graph_out))
+    lines.append("")
+    lines.append(explain_transformation(graph_in, graph_out, operator))
+    lines.append("=" * 50)
+    
+    return "\n".join(lines)
+
+
 # Export
 __all__ = [
     'ConceptType', 'RelationType', 'Concept', 'Relation', 
     'SemanticGraph', 'extract_semantic_graph',
     'InputPropertyMatcher', 'relativize_operator',
-    'ObjectContext', 'compute_object_relations', 'build_scene_graph'
+    'ObjectContext', 'compute_object_relations', 'build_scene_graph',
+    'explain_scene', 'explain_transformation', 'explain_arc_solution'
 ]

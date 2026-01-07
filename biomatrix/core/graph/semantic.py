@@ -1625,13 +1625,29 @@ def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[
             else:
                 position_class = ('SINGLE', 'SINGLE')
             
+            # Shape: aspect ratio (TALL, WIDE, SQUARE)
+            if obj_in.n_dims >= 2 and obj_in.n_points > 1:
+                extent = obj_in.points[:, :2].max(axis=0) - obj_in.points[:, :2].min(axis=0) + 1
+                aspect = extent[0] / (extent[1] + 1e-6)
+                shape_class = 'TALL' if aspect > 1.5 else 'WIDE' if aspect < 0.67 else 'SQUARE'
+            else:
+                shape_class = 'POINT'
+            
+            # Size class (relative to all objects in scene)
+            all_masses = [o.n_points for o in objs_in]
+            max_mass = max(all_masses) if all_masses else 1
+            relative_size = obj_in.n_points / max_mass
+            size_class = 'SMALL' if relative_size < 0.33 else 'LARGE' if relative_size > 0.67 else 'MEDIUM'
+            
             features = {
                 'n_points': obj_in.n_points,
                 'continuous_dims': continuous_dims,
                 'discrete_dims': discrete_dims,
                 'color': color_value,
                 'position': position_class,
-                'mass': obj_in.n_points
+                'mass': obj_in.n_points,
+                'shape': shape_class,
+                'size_class': size_class
             }
             
             observations.append({
@@ -1661,16 +1677,20 @@ def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[
         
         n_points_arr = np.array([f['n_points'] for f in data['obs']])
         
-        # Extract color patterns from this group
+        # Extract patterns from this group
         colors_in = [f.get('color') for f in data['obs'] if f.get('color') is not None]
         positions = [f.get('position') for f in data['obs'] if f.get('position') is not None]
+        shapes = [f.get('shape') for f in data['obs'] if f.get('shape') is not None]
+        sizes = [f.get('size_class') for f in data['obs'] if f.get('size_class') is not None]
         
         group_profiles[sig] = {
             'count': len(data['obs']),
             'n_points_mean': float(n_points_arr.mean()),
             'transform_type': sig,
             'colors': list(set(colors_in)) if colors_in else [],
-            'positions': list(set(positions)) if positions else []
+            'positions': list(set(positions)) if positions else [],
+            'shapes': list(set(shapes)) if shapes else [],
+            'size_classes': list(set(sizes)) if sizes else []
         }
     
     # Compute dominant extent_ratio (most common)
@@ -1705,11 +1725,15 @@ def match_object_to_group(obj_features: Dict, group_profiles: Dict) -> Optional[
     obj_n = obj_features['n_points']
     obj_color = obj_features.get('color')
     obj_pos = obj_features.get('position')
+    obj_shape = obj_features.get('shape')
+    obj_size = obj_features.get('size_class')
     
     for sig, profile in group_profiles.items():
         n_mean = profile['n_points_mean']
         profile_colors = profile.get('colors', [])
         profile_positions = profile.get('positions', [])
+        profile_shapes = profile.get('shapes', [])
+        profile_sizes = profile.get('size_classes', [])
         
         # Compute match score (lower = better)
         # n_points deviation (relative)
@@ -1721,18 +1745,25 @@ def match_object_to_group(obj_features: Dict, group_profiles: Dict) -> Optional[
             if obj_color in profile_colors:
                 color_match = 0.0  # Perfect match
             else:
-                color_match = 0.5  # Partial penalty
+                color_match = 0.5
         
         # Position match bonus
         pos_match = 1.0
         if obj_pos is not None and profile_positions:
-            if obj_pos in profile_positions:
-                pos_match = 0.0
-            else:
-                pos_match = 0.3
+            pos_match = 0.0 if obj_pos in profile_positions else 0.3
         
-        # Combined score: weight n_points heavily, color and position as bonuses
-        total_score = n_dev + 0.3 * color_match + 0.2 * pos_match
+        # Shape match bonus
+        shape_match = 1.0
+        if obj_shape is not None and profile_shapes:
+            shape_match = 0.0 if obj_shape in profile_shapes else 0.4
+        
+        # Size class match bonus
+        size_match = 1.0
+        if obj_size is not None and profile_sizes:
+            size_match = 0.0 if obj_size in profile_sizes else 0.3
+        
+        # Combined score: weight n_points heavily, others as bonuses
+        total_score = n_dev + 0.3 * color_match + 0.2 * pos_match + 0.15 * shape_match + 0.15 * size_match
         
         if total_score < best_score:
             best_score = total_score
@@ -1848,7 +1879,9 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
             'discrete_dims': discrete_dims,
             'color': color_value,
             'position': position_class,
-            'mass': obj.n_points
+            'mass': obj.n_points,
+            'shape': 'TALL' if obj.n_dims >= 2 and obj.n_points > 1 and (obj.points[:, :2].max(axis=0) - obj.points[:, :2].min(axis=0) + 1)[0] / ((obj.points[:, :2].max(axis=0) - obj.points[:, :2].min(axis=0) + 1)[1] + 1e-6) > 1.5 else 'WIDE' if obj.n_dims >= 2 and obj.n_points > 1 and (obj.points[:, :2].max(axis=0) - obj.points[:, :2].min(axis=0) + 1)[0] / ((obj.points[:, :2].max(axis=0) - obj.points[:, :2].min(axis=0) + 1)[1] + 1e-6) < 0.67 else 'SQUARE',
+            'size_class': 'SMALL' if obj.n_points < max(o.n_points for o in test_objs) * 0.33 else 'LARGE' if obj.n_points > max(o.n_points for o in test_objs) * 0.67 else 'MEDIUM'
         }
         
         # Match to group

@@ -18,14 +18,28 @@ from ..base import Operator, SequentialOperator
 
 @dataclass
 class IdentityOperator(Operator):
-    """
-    Identity Operator: I(S) = S.
-    """
+    """Identity Operator: I(S) = S."""
+    
     def apply(self, state: 'State') -> 'State':
         return state.copy()
     
+    def inverse(self) -> 'IdentityOperator':
+        return IdentityOperator()
+    
+    def to_symbolic(self) -> str:
+        return "Id"
+    
+    @property
+    def category(self):
+        from ..base import OperatorCategory
+        return OperatorCategory.IDENTITY
+    
     @property
     def is_identity(self) -> bool:
+        return True
+    
+    @property
+    def is_invertible(self) -> bool:
         return True
 
 

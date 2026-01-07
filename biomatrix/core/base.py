@@ -118,11 +118,24 @@ class SequentialOperator(Operator):
         return SequentialOperator(steps=inv_steps)
     
     def simplify(self) -> 'Operator':
-        """Remove consecutive T ∘ T⁻¹ pairs and identity operators."""
+        """Algebraic simplification: remove identities, T ∘ T⁻¹ pairs, merge affines."""
         from .operators.base import IdentityOperator
         
-        # Filter out identities
-        simplified = [op for op in self.steps if not op.is_identity]
+        # Step 1: Recursively simplify nested steps
+        simplified = [op.simplify() if hasattr(op, 'simplify') else op for op in self.steps]
+        
+        # Step 2: Filter out identities
+        simplified = [op for op in simplified if not op.is_identity]
+        
+        # Step 3: Merge consecutive AffineTransforms
+        merged = []
+        for op in simplified:
+            if merged and self._can_merge(merged[-1], op):
+                merged[-1] = merged[-1].compose(op)
+            else:
+                merged.append(op)
+        
+        simplified = merged
         
         if not simplified:
             return IdentityOperator()
@@ -131,6 +144,12 @@ class SequentialOperator(Operator):
             return simplified[0]
         
         return SequentialOperator(steps=simplified)
+    
+    def _can_merge(self, op1: 'Operator', op2: 'Operator') -> bool:
+        """Check if two operators can be algebraically merged."""
+        # Import here to avoid circular
+        from .transform import AffineTransform
+        return isinstance(op1, AffineTransform) and isinstance(op2, AffineTransform)
     
     def to_symbolic(self) -> str:
         """Symbolic representation."""

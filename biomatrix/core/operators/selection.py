@@ -299,6 +299,21 @@ class DeleteOperator(Operator):
             return State(np.empty((0, state.n_dims)))
         
         return State(points=filtered_points)
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        mode = "keep" if self.keep else "del"
+        return f"δ({mode} d{self.dim}={self.value:.1f})"
+    
+    @property
+    def category(self):
+        from ..base import OperatorCategory
+        return OperatorCategory.INJECTION
+    
+    @property
+    def preserves_mass(self) -> bool:
+        return False
 
 
 @dataclass
@@ -342,6 +357,24 @@ class FilterOperator(Operator):
         projected_points = state.points[mask]
         
         return State(points=projected_points)
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        return f"π(d{self.dim}{self.comparison}{self.threshold:.1f})"
+    
+    @property
+    def category(self):
+        from ..base import OperatorCategory
+        return OperatorCategory.PROJECTION
+    
+    @property
+    def is_idempotent(self) -> bool:
+        return True
+    
+    @property
+    def preserves_mass(self) -> bool:
+        return False
 
 
 # Alias for backward compatibility

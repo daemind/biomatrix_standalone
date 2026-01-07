@@ -51,7 +51,7 @@ class ValuePermutationOperator(Operator):
     Applies per-dimension value mappings:
     π: V_d -> V_d' for each dimension d.
     
-    AGENT.md: Pure algebraic, N-dim agnostic.
+    AGENT.md: Pure algebraic via broadcasting, N-dim agnostic.
     """
     permutation_maps: List[dict]  # List of {old_val: new_val} per dimension
     
@@ -62,14 +62,32 @@ class ValuePermutationOperator(Operator):
         new_points = state.points.copy()
         n_dims = min(len(self.permutation_maps), state.n_dims)
         
-        # ALGEBRAIC: Apply permutation per dimension using reduce
+        # ALGEBRAIC: Pure NumPy indexing via broadcasting (no np.vectorize)
         def apply_dim_perm(pts, d):
             if d >= len(self.permutation_maps):
                 return pts
             vmap = self.permutation_maps[d]
-            lookup = np.vectorize(lambda v: vmap.get(np.round(v, State.DECIMALS), v))
+            if not vmap:
+                return pts
+            
+            # Build lookup arrays from dict
+            keys = np.array(list(vmap.keys()))
+            vals = np.array(list(vmap.values()))
+            
             result = pts.copy()
-            result[:, d] = lookup(pts[:, d])
+            col = np.round(pts[:, d], State.DECIMALS)
+            
+            # Broadcasting: find matches via outer comparison
+            # matches[i, j] = True if col[i] matches keys[j]
+            matches = np.isclose(col[:, None], keys[None, :])
+            
+            # Get index of matched key (take first match per row)
+            has_match = matches.any(axis=1)
+            match_indices = np.argmax(matches, axis=1)
+            
+            # Apply mapping only where match exists
+            result[has_match, d] = vals[match_indices[has_match]]
+            
             return result
         
         new_points = reduce(apply_dim_perm, range(n_dims), new_points)

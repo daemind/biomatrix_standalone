@@ -74,11 +74,26 @@ def derive_value_permutation(s_in: State, s_out: State, tol: float = 0.1) -> Opt
     if any(pmap is None for pmap in permutation_maps):
         return None
     
-    # ALGEBRAIC: Apply permutation via stacked vectorized lookup
+    # ALGEBRAIC: Apply permutation via pure NumPy indexing (no np.vectorize)
     def apply_perm_dim(d: int) -> np.ndarray:
         vmap = permutation_maps[d]
-        lookup = np.vectorize(lambda v: vmap.get(v, v))
-        return lookup(X_rounded[:, d])
+        if not vmap:
+            return X_rounded[:, d]
+        
+        # Build lookup arrays from dict
+        keys = np.array(list(vmap.keys()))
+        vals = np.array(list(vmap.values()))
+        col = X_rounded[:, d]
+        
+        # Broadcasting: find matches via outer comparison
+        matches = np.isclose(col[:, None], keys[None, :])
+        has_match = matches.any(axis=1)
+        match_indices = np.argmax(matches, axis=1)
+        
+        # Apply mapping, default to original for unmatched
+        result = col.copy()
+        result[has_match] = vals[match_indices[has_match]]
+        return result
     
     Y_pred = np.column_stack(list(map(apply_perm_dim, range(n_dims))))
     

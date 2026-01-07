@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""
-topology.py - Topological Object Detection
-
-FUNDAMENTAL PRINCIPLE: Objects are connected components.
-Not bounding boxes, not coordinate ranges - TOPOLOGICAL definition.
-"""
+"""Topological object detection and connectivity analysis."""
 
 import numpy as np
 from typing import List, Tuple
@@ -21,19 +16,7 @@ from scipy.spatial.distance import cdist
 
 
 def partition_by_value(state: State, projection_dims: List[int] = None) -> List[State]:
-    """
-    Partition state into DISJOINT groups by EQUAL VALUE on projection dimension(s).
-    
-    ALGEBRAIC DEFINITION: Partition = Disjoint Union  (U = ⊔ S_i)
-    - Exhaustive: Every point belongs to EXACTLY ONE group.
-    - Exclusive: Intersection of any two groups = empty.
-    
-    PROJECTION-BASED: Points with EQUAL VALUE on the projection dims = same group.
-    This is selection/filtering, not spatial clustering.
-    
-    If projection_dims is None, the dimension with MINIMUM variance is used for grouping
-    (this is the dimension that varies least = likely categorical/label).
-    """
+    """Partition state into groups by equal value on projection dimension(s)."""
     if state.is_empty:
         return []
     
@@ -43,11 +26,10 @@ def partition_by_value(state: State, projection_dims: List[int] = None) -> List[
     if n_points == 1:
         return [state]
     
-    # Auto-detect grouping dimension: the one with least variance (categorical)
+    # Auto-detect: use dimension with minimum variance
     if projection_dims is None:
         variances = np.var(points, axis=0)
-        # Find dimension with minimum variance (if all are same variance, use last)
-        min_var_dim = np.argmin(variances)
+        min_var_dim = int(np.argmin(variances))
         projection_dims = [min_var_dim]
     
     projection_dims = np.atleast_1d(projection_dims)
@@ -55,60 +37,33 @@ def partition_by_value(state: State, projection_dims: List[int] = None) -> List[
     # Project onto grouping dimensions
     projected = points[:, projection_dims]
     
-    # Group by UNIQUE VALUES (algebraic partition by equality)
+    # Group by unique values
     projected_rounded = np.round(projected, decimals=6)
     unique_values, inverse_indices = np.unique(projected_rounded, axis=0, return_inverse=True)
     
-    # Build disjoint groups
-    components = []
-    for i in range(len(unique_values)):
-        mask = inverse_indices == i
-        components.append(State(points=points[mask]))
-        
-    return components
+    return [State(points=points[inverse_indices == i]) for i in range(len(unique_values))]
 
 
 def get_component_labels(state: State, mode: str = 'moore', **kwargs) -> np.ndarray:
-    """
-    Compute connected component labels for each point in the state.
-    
-    ALGEBRAIC DEFINITION:
-    Graph G(V, E) where V = Points.
-    E = {(u, v) | A_uv = 1}.
-    
-    Returns:
-        labels: (N,) int array of component IDs.
-    """
+    """Compute connected component labels for each point."""
     if state.is_empty:
         return np.array([], dtype=int)
     if state.n_points == 1:
         return np.array([0], dtype=int)
         
-    # 1. Adjacency Matrix
-    # Use unified generator logic
     A = get_adjacency_matrix(state, mode, **kwargs)
-    
-    # 2. Label
-    
     n_components, labels = connected_components(csr_matrix(A), directed=False)
     return labels
 
 def partition_by_connectivity(state: State, mode: str = None, **kwargs) -> List[State]:
-    """
-    Partition state into Connected Components (Objects).
-    Uses get_component_labels for strict topological consistency.
-    """
+    """Partition state into connected components."""
     if state.is_empty:
         return []
         
     labels = get_component_labels(state, mode, **kwargs)
     n_components = labels.max() + 1 if len(labels) > 0 else 0
-    
     points = state.points
-    components = []
     
-    # Group points by label (Algebraic Partitioning)
-    # Using map() to eliminate the for loop.
     return list(map(lambda i: State(points=points[labels == i]), range(n_components)))
 
 
@@ -117,23 +72,12 @@ detect_objects = partition_by_connectivity # Alias for topological detection
 detect_groups_by_value = partition_by_value # Alias for value grouping
 
 def get_extremities(state: State, mode: str = 'moore') -> List[np.ndarray]:
-    """
-    Identify extremities (endpoints) of a topological object.
-    An extremity is a point with exactly 1 neighbor in the connectivity graph.
-    
-    ALGEBRAIC: Uses vectorized distance matrix computation.
-    """
+    """Identify extremities (points with exactly 1 neighbor)."""
     if state.n_points < 2:
         return [p for p in state.points]
     
-    # 1. Adjacency
     A = get_adjacency_matrix(state, mode)
-    
-    # 2. Neighbor Count (Degree)
-    # A is sparse csr_matrix. sum(axis=1) returns np.matrix (Nx1)
-    degree_matrix = A.sum(axis=1)
-    degree = np.array(degree_matrix).flatten() # Convert to flat array
-    
+    degree = np.array(A.sum(axis=1)).flatten()
     extremity_mask = degree == 1
     return [state.points[i] for i in np.where(extremity_mask)[0]]
 
@@ -175,36 +119,24 @@ def get_euler_number(state: State) -> int:
     if label is None:
         return 1 if not state.is_empty else 0
         
-    # ... (Existing Voxel Logic) ...
-    # Convert state to dense grid (N-dim) using bounds
     bbox_min = state.bbox_min.astype(int)
     bbox_max = state.bbox_max.astype(int)
     
-    # Check volume memory limit
     shape = tuple(bbox_max - bbox_min + 1)
-    if np.prod(shape) > 1e7: # 10M voxels safety limit
-         # Fallback to Graph Method
+    if np.prod(shape) > 1e7:  # 10M voxels limit
          A = get_adjacency_matrix(state, mode='moore')
          return state.n_points - (A.nnz // 2)
 
     grid = np.zeros(shape, dtype=int)
-    # Vectorized Grid Filling (Tensor Friendly)
-    # 1. Quantize to Lattice Indices
     indices = (state.points - bbox_min).astype(int)
-    
-    # 2. Filter out-of-bounds (robustness)
     valid_mask = np.all((indices >= 0) & (indices < np.array(shape)), axis=1)
     valid_indices = indices[valid_mask]
     
     if len(valid_indices) == 0:
         return 1
         
-    # 3. Flatten indices for fast assignment
     raveled_indices = np.ravel_multi_index(valid_indices.T, shape)
-    
-    # 4. Fill Grid
     grid.ravel()[raveled_indices] = 1
-             
     binary = grid
     
     # N-dim structure (connectivity)
@@ -227,20 +159,8 @@ def is_hollow(state: State) -> bool:
     return get_euler_number(state) <= 0
 
 
-# =========================================================================
-# Matrix Flow Cavity Detection (Neuronal Approach)
-# =========================================================================
-
 def get_generators(n_dims: int, connectivity: int = 8) -> np.ndarray:
-    """
-    Generate the basis vectors for the Algebraic Neighborhood Group.
-    
-    Args:
-        n_dims: Number of spatial dimensions.
-        connectivity: 4 (Von Neumann / L1) or 8 (Moore / L_inf).
-                      For N > 2, '4' means 2*N neighbors (faces), 
-                      '8' means 3^N - 1 neighbors (faces + diagonals).
-    """
+    """Generate neighborhood basis vectors. 4=Von Neumann, 8=Moore."""
     
     if connectivity == 4:
         # Von Neumann: Permutations of (±1, 0, ..., 0)

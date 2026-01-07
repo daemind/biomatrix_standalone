@@ -158,6 +158,9 @@ class LiftOperator(Operator):
             elif v != ov:
                 return False
         return True
+    
+    def to_symbolic(self) -> str:
+        return f"Φ({self.lifter})"
 
 
 @dataclass
@@ -271,6 +274,13 @@ class SliceOperator(Operator):
                 self.slice_range == other.slice_range and
                 self.slice_axis == other.slice_axis and
                 self.original_dims == other.original_dims)
+    
+    def to_symbolic(self) -> str:
+        if self.slice_values:
+            return f"Π({len(self.slice_values)} vals)"
+        elif self.slice_range:
+            return f"Π[{self.slice_range[0]:.1f},{self.slice_range[1]:.1f}]"
+        return f"Π(→{self.original_dims}D)"
 
 
 # =============================================================================
@@ -313,6 +323,30 @@ class LiftedTransform(Operator):
         return (self.lift == other.lift and 
                 self.bijection == other.bijection and 
                 self.slice == other.slice)
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        parts = []
+        if self.lift:
+            parts.append(self.lift.to_symbolic())
+        if self.bijection:
+            b = self.bijection
+            if b.translation is not None and np.linalg.norm(b.translation) > 1e-6:
+                parts.append(f"B(t={np.linalg.norm(b.translation):.1f})")
+            else:
+                parts.append("B")
+        if self.slice:
+            parts.append(self.slice.to_symbolic())
+        return " → ".join(parts) if parts else "Id"
+    
+    @property
+    def category(self):
+        from ..base import OperatorCategory
+        # LiftedTransform can change mass depending on slice
+        if self.slice and (self.slice.slice_values or self.slice.slice_range):
+            return OperatorCategory.INJECTION  # Slice reduces mass
+        return OperatorCategory.BIJECTION  # Pure bijection in lifted space
 
 
 

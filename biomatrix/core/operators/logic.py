@@ -65,6 +65,17 @@ class UnionOperator(LogicOperator):
         final_points = np.unique(all_points, axis=0)
         
         return State(points=final_points)
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        parts = [op.to_symbolic() if hasattr(op, 'to_symbolic') else type(op).__name__ for op in self.operands]
+        return "(" + " ∪ ".join(parts) + ")"
+    
+    @property
+    def category(self):
+        from ..base import OperatorCategory
+        return OperatorCategory.SURJECTION  # Union can increase mass
 
     def is_semantically_equal(self, other: Operator) -> bool:
         """
@@ -176,6 +187,17 @@ class IntersectionOperator(LogicOperator):
         
         results = [op.apply(state) for op in self.operands]
         return reduce(intersect, results) if results else state.copy()
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        parts = [op.to_symbolic() if hasattr(op, 'to_symbolic') else type(op).__name__ for op in self.operands]
+        return "(" + " ∩ ".join(parts) + ")"
+    
+    @property
+    def category(self):
+        from ..base import OperatorCategory
+        return OperatorCategory.INJECTION  # Intersection reduces mass
 
 
 @dataclass
@@ -197,6 +219,17 @@ class DifferenceOperator(LogicOperator):
         
         results = [op.apply(state) for op in self.operands]
         return reduce(difference, results) if results else state.copy()
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        parts = [op.to_symbolic() if hasattr(op, 'to_symbolic') else type(op).__name__ for op in self.operands]
+        return "(" + " \\ ".join(parts) + ")"
+    
+    @property
+    def category(self):
+        from ..base import OperatorCategory
+        return OperatorCategory.INJECTION  # Difference reduces mass
 
 
 @dataclass

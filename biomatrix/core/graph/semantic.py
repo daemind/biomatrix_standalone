@@ -1606,48 +1606,48 @@ def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[
                 'GROW' if dn_points > 0 else 'SHRINK' if dn_points < 0 else 'SAME'
             )
             
-            # Compute OBJECT PROPERTIES (algebraic invariants)
-            # These enable rules like "red objects → blue" or "leftmost → grows"
-            color_value = None
-            if n_dims > 2:
-                color_value = int(np.round(np.mean(obj_in.points[:, 2])))
+            # PURE VECTORIAL SIGNATURE (no thresholds, no categories)
+            # Feature vector: [n_points_normalized, aspect_ratio, relative_mass, pos_x, pos_y, color]
             
-            # Relative position (compared to centroid of all objects)
-            centroid_in = obj_in.centroid[:2] if obj_in.n_dims >= 2 else obj_in.centroid
-            all_centroids = [o.centroid[:2] for o in objs_in if o.n_dims >= 2]
-            if len(all_centroids) > 1:
-                global_center = np.mean(all_centroids, axis=0)
-                rel_pos = centroid_in - global_center
-                position_class = (
-                    'LEFT' if rel_pos[0] < -0.5 else 'RIGHT' if rel_pos[0] > 0.5 else 'CENTER_H',
-                    'TOP' if rel_pos[1] < -0.5 else 'BOTTOM' if rel_pos[1] > 0.5 else 'CENTER_V'
-                )
-            else:
-                position_class = ('SINGLE', 'SINGLE')
+            # Normalized n_points (relative to scene max)
+            all_masses = np.array([o.n_points for o in objs_in])
+            n_points_norm = obj_in.n_points / (all_masses.max() + 1e-6)
             
-            # Shape: aspect ratio (TALL, WIDE, SQUARE)
+            # Aspect ratio (continuous)
             if obj_in.n_dims >= 2 and obj_in.n_points > 1:
                 extent = obj_in.points[:, :2].max(axis=0) - obj_in.points[:, :2].min(axis=0) + 1
-                aspect = extent[0] / (extent[1] + 1e-6)
-                shape_class = 'TALL' if aspect > 1.5 else 'WIDE' if aspect < 0.67 else 'SQUARE'
+                aspect_ratio = extent[0] / (extent[1] + 1e-6)
             else:
-                shape_class = 'POINT'
+                aspect_ratio = 1.0
             
-            # Size class (relative to all objects in scene)
-            all_masses = [o.n_points for o in objs_in]
-            max_mass = max(all_masses) if all_masses else 1
-            relative_size = obj_in.n_points / max_mass
-            size_class = 'SMALL' if relative_size < 0.33 else 'LARGE' if relative_size > 0.67 else 'MEDIUM'
+            # Relative position (normalized continuous vector)
+            centroid_in = obj_in.centroid[:2] if obj_in.n_dims >= 2 else np.zeros(2)
+            all_centroids = np.array([o.centroid[:2] for o in objs_in if o.n_dims >= 2])
+            if len(all_centroids) > 1:
+                global_center = all_centroids.mean(axis=0)
+                spread = all_centroids.std(axis=0) + 1e-6
+                rel_pos = (centroid_in - global_center) / spread  # Normalized
+            else:
+                rel_pos = np.zeros(2)
+            
+            # Color (as continuous value, normalized to [0, 1] range if possible)
+            color_value = 0.0
+            if n_dims > 2:
+                color_value = float(np.mean(obj_in.points[:, 2]))
+            
+            # Build feature vector (pure continuous, no categories)
+            feature_vec = np.array([
+                n_points_norm,
+                aspect_ratio,
+                rel_pos[0],
+                rel_pos[1],
+                color_value
+            ])
             
             features = {
+                'feature_vec': feature_vec,  # Pure continuous vector
                 'n_points': obj_in.n_points,
-                'continuous_dims': continuous_dims,
-                'discrete_dims': discrete_dims,
-                'color': color_value,
-                'position': position_class,
-                'mass': obj_in.n_points,
-                'shape': shape_class,
-                'size_class': size_class
+                'color': int(np.round(color_value)) if color_value > 0 else None
             }
             
             observations.append({
@@ -1669,61 +1669,40 @@ def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[
         groups[sig]['spatial'].append(obs['spatial_delta'])
         groups[sig]['chromatic'].append(obs['chromatic'])
     
-    # Profile each group
+    # Profile each group with PURE VECTORIAL CENTROID
     group_profiles = {}
     for sig, data in groups.items():
         if not data['obs']:
             continue
         
-        n_points_arr = np.array([f['n_points'] for f in data['obs']])
+        # Stack all feature vectors for this group
+        feature_vecs = [f.get('feature_vec') for f in data['obs'] if f.get('feature_vec') is not None]
         
-        # Extract patterns from this group
-        colors_in = [f.get('color') for f in data['obs'] if f.get('color') is not None]
-        positions = [f.get('position') for f in data['obs'] if f.get('position') is not None]
-        shapes = [f.get('shape') for f in data['obs'] if f.get('shape') is not None]
-        sizes = [f.get('size_class') for f in data['obs'] if f.get('size_class') is not None]
-        
-        group_profiles[sig] = {
-            'count': len(data['obs']),
-            'n_points_mean': float(n_points_arr.mean()),
-            'transform_type': sig,
-            'colors': list(set(colors_in)) if colors_in else [],
-            'positions': list(set(positions)) if positions else [],
-            'shapes': list(set(shapes)) if shapes else [],
-            'size_classes': list(set(sizes)) if sizes else []
-        }
+        if feature_vecs:
+            # Centroid = mean of all feature vectors (no thresholds, no categories)
+            feature_matrix = np.vstack(feature_vecs)
+            centroid = feature_matrix.mean(axis=0)
+            
+            group_profiles[sig] = {
+                'count': len(data['obs']),
+                'feature_centroid': centroid,  # Pure vectorial centroid
+                'transform_type': sig,
+                'colors': list(set(f.get('color') for f in data['obs'] if f.get('color') is not None))
+            }
     
     # Compute dominant extent_ratio (most common)
     dominant_extent_ratio = max(set(global_extent_ratios), key=global_extent_ratios.count) if global_extent_ratios else (1.0, 1.0)
     is_shape_change = any(r != 1.0 for r in dominant_extent_ratio)
     
-    # DERIVE EXPLICIT RULES from observations
-    # Rule = (predicate, transformation) where predicate is a dict of property conditions
+    # DERIVE RULES from observations (pure vectorial - no categorical predicates)
+    # Each rule = (feature_centroid, transformation)
     rules = []
-    for sig, data in groups.items():
-        if not data['obs']:
-            continue
-        
-        # Find common properties for this transformation type
-        colors = [f.get('color') for f in data['obs'] if f.get('color') is not None]
-        shapes = [f.get('shape') for f in data['obs'] if f.get('shape') is not None]
-        positions = [f.get('position') for f in data['obs'] if f.get('position') is not None]
-        sizes = [f.get('size_class') for f in data['obs'] if f.get('size_class') is not None]
-        
-        # If property is consistent across observations, it becomes a predicate
-        predicate = {}
-        if len(set(colors)) == 1 and colors:
-            predicate['color'] = colors[0]
-        if len(set(shapes)) == 1 and shapes:
-            predicate['shape'] = shapes[0]
-        if len(set(sizes)) == 1 and sizes:
-            predicate['size_class'] = sizes[0]
-        
-        if predicate:  # Only create rule if there's a distinguishing predicate
+    for sig, profile in group_profiles.items():
+        if 'feature_centroid' in profile:
             rules.append({
-                'predicate': predicate,
+                'feature_centroid': profile['feature_centroid'],
                 'transformation': sig,
-                'chromatic_map': data.get('chromatic', {})
+                'colors': profile.get('colors', [])
             })
     
     return {
@@ -1734,110 +1713,59 @@ def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[
         'chromatic_bijection': chromatic_bijections,
         'extent_ratio': dominant_extent_ratio,
         'is_shape_change': is_shape_change,
-        'rules': rules,  # Explicit IF-THEN rules
-        'periodicity_detected': any(obs.get('periodicity', False) for pair in training_pairs for obs in [])
+        'rules': rules
     }
 
 
 def explain_rules(rules: List[Dict]) -> str:
     """
     Generate human-readable explanation of derived rules.
-    
-    Returns a string like:
-    "Rule 1: IF color=3 AND shape=TALL THEN apply CHROMATIC transformation"
+    Pure vectorial: shows feature centroid and transformation.
     """
     lines = []
     for i, rule in enumerate(rules, 1):
-        pred = rule['predicate']
+        centroid = rule.get('feature_centroid', np.zeros(5))
         trans = rule['transformation']
+        colors = rule.get('colors', [])
         
-        # Build predicate string
-        conditions = []
-        if 'color' in pred:
-            conditions.append(f"color={pred['color']}")
-        if 'shape' in pred:
-            conditions.append(f"shape={pred['shape']}")
-        if 'size_class' in pred:
-            conditions.append(f"size={pred['size_class']}")
-        if 'position' in pred:
-            conditions.append(f"position={pred['position']}")
-        
-        pred_str = " AND ".join(conditions) if conditions else "ANY"
-        
-        # Build transformation string
+        centroid_str = ", ".join(f"{v:.2f}" for v in centroid)
         spatial_t, chromatic_t, size_t = trans
-        trans_parts = []
-        if spatial_t != 'STATIC':
-            trans_parts.append(f"move ({spatial_t})")
-        if chromatic_t != 'PRESERVE':
-            trans_parts.append(f"recolor ({chromatic_t})")
-        if size_t != 'SAME':
-            trans_parts.append(f"resize ({size_t})")
         
-        trans_str = " + ".join(trans_parts) if trans_parts else "identity"
-        
-        lines.append(f"Rule {i}: IF {pred_str} THEN {trans_str}")
+        lines.append(f"Rule {i}: centroid=[{centroid_str}] → {spatial_t}/{chromatic_t}/{size_t}")
+        if colors:
+            lines[-1] += f" (colors: {colors})"
     
-    return "\n".join(lines) if lines else "No explicit rules derived"
+    return "\n".join(lines) if lines else "No rules derived"
+
 
 def match_object_to_group(obj_features: Dict, group_profiles: Dict) -> Optional[Tuple]:
     """
-    Match an object to the best causal group based on feature similarity.
+    Match an object to best causal group via PURE EUCLIDEAN DISTANCE.
     
-    Uses n_points, color, and position for matching.
-    Returns the transformation signature for the best matching group.
+    No thresholds, no weights, no categories.
+    Returns the transformation signature for the closest group.
     """
     if not group_profiles:
         return None
     
+    obj_vec = obj_features.get('feature_vec')
+    if obj_vec is None:
+        return None
+    
     best_sig = None
-    best_score = float('inf')
+    best_dist = float('inf')
     
-    obj_n = obj_features['n_points']
-    obj_color = obj_features.get('color')
-    obj_pos = obj_features.get('position')
-    obj_shape = obj_features.get('shape')
-    obj_size = obj_features.get('size_class')
-    
+    # Pure distance-based matching: closest centroid wins
     for sig, profile in group_profiles.items():
-        n_mean = profile['n_points_mean']
-        profile_colors = profile.get('colors', [])
-        profile_positions = profile.get('positions', [])
-        profile_shapes = profile.get('shapes', [])
-        profile_sizes = profile.get('size_classes', [])
+        centroid = profile.get('feature_centroid')
+        if centroid is None:
+            continue
         
-        # Compute match score (lower = better)
-        # n_points deviation (relative)
-        n_dev = abs(obj_n - n_mean) / max(n_mean, 1)
+        # Euclidean distance in feature space (no thresholds, no weights)
+        dist = np.linalg.norm(obj_vec - centroid)
         
-        # Color match bonus (if color matches group colors, reduce score)
-        color_match = 1.0
-        if obj_color is not None and profile_colors:
-            if obj_color in profile_colors:
-                color_match = 0.0  # Perfect match
-            else:
-                color_match = 0.5
-        
-        # Position match bonus
-        pos_match = 1.0
-        if obj_pos is not None and profile_positions:
-            pos_match = 0.0 if obj_pos in profile_positions else 0.3
-        
-        # Shape match bonus
-        shape_match = 1.0
-        if obj_shape is not None and profile_shapes:
-            shape_match = 0.0 if obj_shape in profile_shapes else 0.4
-        
-        # Size class match bonus
-        size_match = 1.0
-        if obj_size is not None and profile_sizes:
-            size_match = 0.0 if obj_size in profile_sizes else 0.3
-        
-        # Combined score: weight n_points heavily, others as bonuses
-        total_score = n_dev + 0.3 * color_match + 0.2 * pos_match + 0.15 * shape_match + 0.15 * size_match
-        
-        if total_score < best_score:
-            best_score = total_score
+        if dist < best_dist:
+            best_dist = dist
             best_sig = sig
     
     return best_sig
@@ -1926,33 +1854,45 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
     
     for obj in test_objs:
         
-        # Compute same properties as training for matching
-        color_value = None
-        if obj.n_dims > 2:
-            color_value = int(np.round(np.mean(obj.points[:, 2])))
+        # PURE VECTORIAL FEATURE EXTRACTION (same as training)
+        all_masses = np.array([o.n_points for o in test_objs])
+        n_points_norm = obj.n_points / (all_masses.max() + 1e-6)
         
-        # Relative position among test objects
-        centroid = obj.centroid[:2] if obj.n_dims >= 2 else obj.centroid
-        all_test_centroids = [o.centroid[:2] for o in test_objs if o.n_dims >= 2]
-        if len(all_test_centroids) > 1:
-            global_center = np.mean(all_test_centroids, axis=0)
-            rel_pos = centroid - global_center
-            position_class = (
-                'LEFT' if rel_pos[0] < -0.5 else 'RIGHT' if rel_pos[0] > 0.5 else 'CENTER_H',
-                'TOP' if rel_pos[1] < -0.5 else 'BOTTOM' if rel_pos[1] > 0.5 else 'CENTER_V'
-            )
+        # Aspect ratio (continuous)
+        if obj.n_dims >= 2 and obj.n_points > 1:
+            extent = obj.points[:, :2].max(axis=0) - obj.points[:, :2].min(axis=0) + 1
+            aspect_ratio = extent[0] / (extent[1] + 1e-6)
         else:
-            position_class = ('SINGLE', 'SINGLE')
+            aspect_ratio = 1.0
+        
+        # Relative position (normalized continuous vector)
+        centroid = obj.centroid[:2] if obj.n_dims >= 2 else np.zeros(2)
+        all_test_centroids = np.array([o.centroid[:2] for o in test_objs if o.n_dims >= 2])
+        if len(all_test_centroids) > 1:
+            global_center = all_test_centroids.mean(axis=0)
+            spread = all_test_centroids.std(axis=0) + 1e-6
+            rel_pos = (centroid - global_center) / spread
+        else:
+            rel_pos = np.zeros(2)
+        
+        # Color (continuous)
+        color_value = 0.0
+        if obj.n_dims > 2:
+            color_value = float(np.mean(obj.points[:, 2]))
+        
+        # Build feature vector (pure continuous, matches training)
+        feature_vec = np.array([
+            n_points_norm,
+            aspect_ratio,
+            rel_pos[0],
+            rel_pos[1],
+            color_value
+        ])
         
         obj_features = {
+            'feature_vec': feature_vec,
             'n_points': obj.n_points,
-            'continuous_dims': continuous_dims,
-            'discrete_dims': discrete_dims,
-            'color': color_value,
-            'position': position_class,
-            'mass': obj.n_points,
-            'shape': 'TALL' if obj.n_dims >= 2 and obj.n_points > 1 and (obj.points[:, :2].max(axis=0) - obj.points[:, :2].min(axis=0) + 1)[0] / ((obj.points[:, :2].max(axis=0) - obj.points[:, :2].min(axis=0) + 1)[1] + 1e-6) > 1.5 else 'WIDE' if obj.n_dims >= 2 and obj.n_points > 1 and (obj.points[:, :2].max(axis=0) - obj.points[:, :2].min(axis=0) + 1)[0] / ((obj.points[:, :2].max(axis=0) - obj.points[:, :2].min(axis=0) + 1)[1] + 1e-6) < 0.67 else 'SQUARE',
-            'size_class': 'SMALL' if obj.n_points < max(o.n_points for o in test_objs) * 0.33 else 'LARGE' if obj.n_points > max(o.n_points for o in test_objs) * 0.67 else 'MEDIUM'
+            'color': int(np.round(color_value)) if color_value > 0 else None
         }
         
         # Match to group

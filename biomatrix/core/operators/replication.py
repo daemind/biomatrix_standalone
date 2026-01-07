@@ -43,11 +43,16 @@ class LinearSequenceOperator(Operator):
     
     @property
     def is_invertible(self) -> bool:
-        return False  # Mass-increasing
+        return False
+    
+    @property
+    def category(self):
+        from ..base import OperatorCategory
+        return OperatorCategory.SURJECTION
     
     @property
     def preserves_mass(self) -> bool:
-        return False  # Multiplies mass by count
+        return False
 
 
 @dataclass
@@ -241,7 +246,12 @@ class TilingOperator(Operator):
     
     @property
     def is_invertible(self) -> bool:
-        return False  # Mass-increasing, not bijective
+        return False
+    
+    @property
+    def category(self):
+        from ..base import OperatorCategory
+        return OperatorCategory.SURJECTION
     
     @property
     def preserves_mass(self) -> bool:

@@ -4,11 +4,22 @@ base.py - Abstract Base Classes for Algebraic Operators.
 Resolves circular dependencies between operators.py and transform.py.
 """
 from abc import ABC, abstractmethod
-from typing import List, TYPE_CHECKING
+from typing import List, TYPE_CHECKING, Tuple, Optional
 from dataclasses import dataclass
+from enum import Enum, auto
 
 if TYPE_CHECKING:
     from .state import State
+
+
+class OperatorCategory(Enum):
+    """Categorical classification for composition inference."""
+    BIJECTION = auto()      # |T(S)| = |S|, invertible (Affine, Permutation)
+    INJECTION = auto()      # |T(S)| <= |S|, (Select, Filter, Delete)
+    SURJECTION = auto()     # |T(S)| >= |S|, (Tile, Replicate, Minkowski)
+    PROJECTION = auto()     # Idempotent: T² = T (Filter, Select)
+    IDENTITY = auto()       # T(S) = S
+
 
 class NotInvertibleError(Exception):
     """Raised when an operator has no inverse."""
@@ -45,6 +56,27 @@ class Operator(ABC):
     def __matmul__(self, other: 'Operator') -> 'SequentialOperator':
         return self.compose(other)
     
+    # === Type Signature for Composition Inference ===
+    
+    @property
+    def category(self) -> OperatorCategory:
+        """Categorical type for composition rules."""
+        return OperatorCategory.BIJECTION  # Default conservative
+    
+    @property
+    def type_signature(self) -> Tuple[str, str]:
+        """(InputType, OutputType) for composition type checking.
+        
+        Types: 'State', 'Subset', 'Superset', 'Same'
+        """
+        return ('State', 'State')  # Generic
+    
+    def is_composable_with(self, other: 'Operator') -> bool:
+        """Check if self ∘ other is well-typed."""
+        # For now, all operators are composable (State -> State)
+        # Future: check dimensional compatibility
+        return True
+    
     # === Algebraic Properties ===
         
     @property
@@ -53,16 +85,21 @@ class Operator(ABC):
     
     @property
     def is_invertible(self) -> bool:
-        return False
+        return self.category == OperatorCategory.BIJECTION
     
     @property
     def is_linear(self) -> bool:
         return False
     
     @property
+    def is_idempotent(self) -> bool:
+        """T² = T (projections, filters)."""
+        return self.category == OperatorCategory.PROJECTION
+    
+    @property
     def preserves_mass(self) -> bool:
         """True if |T(S)| = |S| for all S."""
-        return True
+        return self.category in (OperatorCategory.BIJECTION, OperatorCategory.IDENTITY)
 
 @dataclass
 class SequentialOperator(Operator):
@@ -101,6 +138,25 @@ class SequentialOperator(Operator):
         return " ∘ ".join(symbols)
     
     # === Algebraic Properties ===
+    
+    @property
+    def category(self) -> OperatorCategory:
+        """Infer category from composition of steps."""
+        categories = [op.category for op in self.steps]
+        
+        # If all bijections, result is bijection
+        if all(c == OperatorCategory.BIJECTION for c in categories):
+            return OperatorCategory.BIJECTION
+        
+        # If any surjection, result grows mass
+        if any(c == OperatorCategory.SURJECTION for c in categories):
+            return OperatorCategory.SURJECTION
+        
+        # If any injection without surjection, result shrinks mass
+        if any(c == OperatorCategory.INJECTION for c in categories):
+            return OperatorCategory.INJECTION
+        
+        return OperatorCategory.BIJECTION  # Default
     
     @property
     def is_identity(self) -> bool:

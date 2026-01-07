@@ -181,8 +181,12 @@ class SelectByValueOperator(Operator):
     
     @property
     def is_idempotent(self) -> bool:
-        """P² = P (applying twice gives same result)."""
         return True
+    
+    @property
+    def category(self):
+        from ..base import OperatorCategory
+        return OperatorCategory.PROJECTION
     
     @property
     def preserves_mass(self) -> bool:

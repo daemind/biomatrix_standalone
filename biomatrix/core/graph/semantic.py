@@ -187,8 +187,146 @@ def extract_semantic_graph(s_in: 'State', s_out: 'State', operator: 'Operator') 
     return graph
 
 
+class InputPropertyMatcher:
+    """
+    Pattern matcher: finds if absolute values match input properties.
+    
+    This is the 'semantic attention' - like LLM attention over tokens,
+    but over semantic concepts from the input.
+    """
+    
+    def __init__(self, state: 'State'):
+        """Build vocabulary of input properties."""
+        self.vocab = {}
+        
+        # Spatial properties
+        if state.n_dims >= 1:
+            self.vocab['input.width'] = state.spread[0]
+            self.vocab['input.bbox_max_x'] = state.bbox_max[0]
+            self.vocab['input.bbox_min_x'] = state.bbox_min[0]
+            self.vocab['input.centroid_x'] = state.centroid[0]
+        
+        if state.n_dims >= 2:
+            self.vocab['input.height'] = state.spread[1]
+            self.vocab['input.bbox_max_y'] = state.bbox_max[1]
+            self.vocab['input.bbox_min_y'] = state.bbox_min[1]
+            self.vocab['input.centroid_y'] = state.centroid[1]
+        
+        if state.n_dims >= 3:
+            self.vocab['input.depth'] = state.spread[2]
+        
+        # Cardinality properties
+        self.vocab['input.n_points'] = state.n_points
+        self.vocab['input.n_dims'] = state.n_dims
+        
+        # Derived properties
+        if state.n_dims >= 2:
+            self.vocab['input.width+1'] = state.spread[0] + 1
+            self.vocab['input.height+1'] = state.spread[1] + 1
+            self.vocab['input.2*width'] = 2 * state.spread[0]
+            self.vocab['input.2*height'] = 2 * state.spread[1]
+    
+    def match(self, value: float, tolerance: float = 1e-6) -> Optional[str]:
+        """
+        Find input property that matches the value.
+        Returns property name (e.g., 'input.width') or None.
+        """
+        for name, prop_val in self.vocab.items():
+            if abs(value - prop_val) < tolerance:
+                return name
+        return None
+    
+    def match_vector(self, vec: np.ndarray, tolerance: float = 1e-6) -> List[Optional[str]]:
+        """Match each component of a vector."""
+        return [self.match(v, tolerance) for v in vec]
+    
+    def match_best(self, value: float) -> Tuple[str, float]:
+        """Find closest match and return (name, error)."""
+        best_name = None
+        best_error = float('inf')
+        
+        for name, prop_val in self.vocab.items():
+            error = abs(value - prop_val)
+            if error < best_error:
+                best_error = error
+                best_name = name
+        
+        return best_name, best_error
+
+
+def relativize_operator(operator: 'Operator', s_in: 'State') -> SemanticGraph:
+    """
+    Convert an operator with absolute values to a semantic graph with relative references.
+    
+    This is the key function for ARC generalization:
+    - Takes: T(14.0)  [absolute, overfits]
+    - Returns: T(input.width) [relative, generalizes]
+    """
+    graph = SemanticGraph()
+    matcher = InputPropertyMatcher(s_in)
+    
+    # Add input concept references
+    graph.add_concept("input.spatial", ConceptType.SPATIAL, reference="input.points[:,:2]")
+    graph.add_concept("input.values", ConceptType.CHROMATIC, reference="input.points[:,2]")
+    graph.add_concept("output.spatial", ConceptType.SPATIAL)
+    graph.add_concept("output.values", ConceptType.CHROMATIC)
+    
+    # Handle AffineTransform
+    if hasattr(operator, 'translation') and operator.translation is not None:
+        t = operator.translation
+        refs = matcher.match_vector(t[:2] if len(t) >= 2 else t)
+        
+        if refs[0] is not None:
+            graph.add_relation("input.spatial", "output.spatial", RelationType.TRANSLATE,
+                             dx=refs[0])
+        else:
+            graph.add_relation("input.spatial", "output.spatial", RelationType.TRANSLATE,
+                             dx=float(t[0]))
+        
+        if len(refs) > 1 and refs[1] is not None:
+            graph.relations[-1].params['dy'] = refs[1]
+        elif len(t) > 1:
+            graph.relations[-1].params['dy'] = float(t[1])
+    
+    # Handle LiftedTransform
+    if hasattr(operator, 'bijection') and operator.bijection is not None:
+        bij = operator.bijection
+        if hasattr(bij, 'translation') and bij.translation is not None:
+            t = bij.translation
+            refs = matcher.match_vector(t[:2] if len(t) >= 2 else t)
+            
+            # Find if the translation matches input properties
+            matched_refs = [r for r in refs if r is not None]
+            if matched_refs:
+                graph.add_relation("input", "output", RelationType.TRANSLATE,
+                                 by=matched_refs[0])
+            else:
+                # Try to match norm
+                t_norm = np.linalg.norm(t[:2] if len(t) >= 2 else t)
+                norm_ref = matcher.match(t_norm)
+                if norm_ref:
+                    graph.add_relation("input", "output", RelationType.TRANSLATE,
+                                     by=norm_ref)
+                else:
+                    best_name, error = matcher.match_best(t_norm)
+                    graph.add_relation("input", "output", RelationType.TRANSLATE,
+                                     by=t_norm, closest=best_name, error=error)
+    
+    # Handle Lift type
+    if hasattr(operator, 'lift') and operator.lift is not None:
+        lift = operator.lift
+        if hasattr(lift, 'lifter'):
+            graph.add_concept("lift.kernel", ConceptType.TOPOLOGICAL, 
+                            value=lift.lifter)
+            graph.add_relation("input", "lifted", RelationType.DEPENDS_ON,
+                             kernel=lift.lifter)
+    
+    return graph
+
+
 # Export
 __all__ = [
     'ConceptType', 'RelationType', 'Concept', 'Relation', 
-    'SemanticGraph', 'extract_semantic_graph'
+    'SemanticGraph', 'extract_semantic_graph',
+    'InputPropertyMatcher', 'relativize_operator'
 ]

@@ -1506,6 +1506,7 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
     """
     from ..topology import partition_by_connectivity
     from ..state import State
+    from ..operators.affine import ValuePermutationOperator
     
     # Detect groups for transformation types
     detected = detect_causal_groups(training_pairs)
@@ -1542,38 +1543,37 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
     continuous_dims = [0, 1] if n_dims >= 2 else list(range(n_dims))
     discrete_dims = list(range(2, n_dims))  # Color dims
     
-    # If tiling detected, generate tiled output
+    # If tiling detected, use TilingOperator (algebraic)
     if is_shape_change and all(r > 1.0 for r in extent_ratio):
-        # TILING: repeat input pattern according to extent_ratio
+        from ..operators.replication import TilingOperator
+        from ..operators.affine import ValuePermutationOperator
+        
         tile_factors = [int(r) for r in extent_ratio[:n_spatial]]
         
-        # Generate tiled positions using meshgrid pattern
-        tiled_points = []
-        for tx in range(tile_factors[0] if len(tile_factors) > 0 else 1):
-            for ty in range(tile_factors[1] if len(tile_factors) > 1 else 1):
-                offset = np.zeros(n_dims)
-                if n_spatial > 0:
-                    offset[0] = tx * input_extent[0]
-                if n_spatial > 1:
-                    offset[1] = ty * input_extent[1]
-                
-                # Clone all points and apply offset
-                new_points = test_input.points.copy()
-                new_points[:, :n_spatial] += offset[:n_spatial]
-                
-                # Apply chromatic bijection
-                for d in discrete_dims:
-                    original_colors = new_points[:, d].copy()
-                    for c_in, c_out in chromatic_bijection.items():
-                        mask = np.isclose(original_colors, c_in)
-                        new_points[mask, d] = c_out
-                
-                tiled_points.append(new_points)
+        # Build translation grid algebraically using meshgrid
+        ranges = [np.arange(tile_factors[d]) * input_extent[d] for d in range(n_spatial)]
+        grids = np.meshgrid(*ranges, indexing='ij')
+        translations = np.stack([g.ravel() for g in grids], axis=-1)
         
-        all_points = np.vstack(tiled_points)
-        predicted = State(all_points)
+        # Pad translations to full n_dims (zeros for non-spatial dims)
+        full_translations = np.zeros((translations.shape[0], n_dims))
+        full_translations[:, :n_spatial] = translations
         
-        lines = ["TILING transformation detected", f"extent_ratio: {extent_ratio}", f"tile: {tile_factors}"]
+        # Apply tiling operator
+        tiling_op = TilingOperator(translations=full_translations)
+        tiled_state = tiling_op.apply(test_input)
+        
+        # Apply chromatic bijection if any
+        if chromatic_bijection:
+            perm_maps = [{} for _ in range(n_dims)]
+            for d in discrete_dims:
+                perm_maps[d] = chromatic_bijection
+            bijection_op = ValuePermutationOperator(permutation_maps=perm_maps)
+            predicted = bijection_op.apply(tiled_state)
+        else:
+            predicted = tiled_state
+        
+        lines = ["TILING via TilingOperator", f"extent_ratio: {extent_ratio}", f"tile: {tile_factors}"]
         return predicted, "\n".join(lines)
     
     for obj in test_objs:
@@ -1591,16 +1591,17 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
             # matched_sig is now transform_type = (SPATIAL_TYPE, CHROMATIC_TYPE, SIZE_TYPE)
             spatial_type, chromatic_type, size_type = matched_sig
             
-            transformed = obj.points.copy()
-            
             # Apply GLOBAL chromatic bijection if chromatic transformation
-            # ATOMIC application: compute all mappings first, then apply
-            if chromatic_type == 'CHROMATIC':
+            if chromatic_type == 'CHROMATIC' and chromatic_bijection:
+                perm_maps = [{} for _ in range(obj.n_dims)]
                 for d in discrete_dims:
-                    original_colors = transformed[:, d].copy()
-                    for c_in, c_out in chromatic_bijection.items():
-                        mask = np.isclose(original_colors, c_in)
-                        transformed[mask, d] = c_out
+                    if d < len(perm_maps):
+                        perm_maps[d] = chromatic_bijection
+                bijection_op = ValuePermutationOperator(permutation_maps=perm_maps)
+                transformed_state = bijection_op.apply(obj)
+                transformed = transformed_state.points
+            else:
+                transformed = obj.points.copy()
             
             # TODO: For spatial transformations, would need to derive actual delta
             # from training data, not from signature
@@ -1612,13 +1613,17 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
                 'n_points': obj.n_points
             })
         else:
-            # Use global bijection if no group match (also atomic)
-            transformed = obj.points.copy()
-            for d in discrete_dims:
-                original_colors = transformed[:, d].copy()
-                for c_in, c_out in chromatic_bijection.items():
-                    mask = np.isclose(original_colors, c_in)
-                    transformed[mask, d] = c_out
+            # Use global bijection if no group match
+            if chromatic_bijection:
+                perm_maps = [{} for _ in range(obj.n_dims)]
+                for d in discrete_dims:
+                    if d < len(perm_maps):
+                        perm_maps[d] = chromatic_bijection
+                bijection_op = ValuePermutationOperator(permutation_maps=perm_maps)
+                transformed_state = bijection_op.apply(obj)
+                transformed = transformed_state.points
+            else:
+                transformed = obj.points.copy()
             result_points_list.append(transformed)
     
     # Combine all points

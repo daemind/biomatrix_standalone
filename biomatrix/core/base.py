@@ -437,3 +437,56 @@ def compare_parameters(ops: List[Operator]) -> dict:
             varying[key] = values
     
     return {'constant': constant, 'varying': varying}
+
+
+def analyze_arc_task(training_pairs: List[Tuple['State', 'State']], derive_fn=None) -> dict:
+    """
+    Full ARC task analysis pipeline.
+    
+    Given training pairs (input, output), derives solutions and analyzes generalization.
+    
+    Args:
+        training_pairs: List of (State_in, State_out) tuples
+        derive_fn: Function to derive operator from pair (default: derive_lift_and_slice)
+    
+    Returns:
+        Complete analysis dict for ARC generalization.
+    """
+    if derive_fn is None:
+        # Lazy import to avoid circular
+        from .derive.lifting import derive_lifting
+        derive_fn = derive_lifting
+    
+    # 1. Derive solution for each pair
+    derived_ops = []
+    for s_in, s_out in training_pairs:
+        op = derive_fn(s_in, s_out)
+        if op:
+            derived_ops.append(op)
+    
+    if not derived_ops:
+        return {'success': False, 'error': 'No solutions derived'}
+    
+    if len(derived_ops) != len(training_pairs):
+        return {'success': False, 'error': f'Only {len(derived_ops)}/{len(training_pairs)} pairs solved'}
+    
+    # 2. Analyze unification
+    unification = unify_solutions(derived_ops, training_pairs)
+    
+    # 3. Extract parameters
+    param_comparison = compare_parameters(derived_ops)
+    
+    # 4. Build result
+    return {
+        'success': True,
+        'n_pairs': len(training_pairs),
+        'n_solved': len(derived_ops),
+        'structural_unified': unification['structural_unified'],
+        'structural_pattern': unification['structural_pattern'],
+        'generalizes': unification['generalizes'],
+        'verified': unification['verified'],
+        'details': unification['details'],
+        'constant_params': param_comparison['constant'],
+        'varying_params': param_comparison['varying'],
+        'operators': derived_ops,  # Return operators for test inference
+    }

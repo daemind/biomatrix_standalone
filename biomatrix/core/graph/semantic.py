@@ -1872,8 +1872,9 @@ def solve_with_affine_composition(training_pairs: List[Tuple['State', 'State']],
     s_in, s_out = training_pairs[0]
     composition = derive_affine_composition(s_in, s_out)
     
+    # Fallback to existing solver if affine composition fails
     if composition is None:
-        return test_input, "Could not derive affine composition"
+        return solve_arc_with_causal_groups(training_pairs, test_input)
     
     n_dims = test_input.n_dims
     

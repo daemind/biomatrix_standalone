@@ -36,3 +36,11 @@ htmlcov/
 # HuggingFace deploy
 hf_demo/
 hf_space_deploy/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so

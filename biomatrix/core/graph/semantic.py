@@ -1606,10 +1606,32 @@ def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[
                 'GROW' if dn_points > 0 else 'SHRINK' if dn_points < 0 else 'SAME'
             )
             
+            # Compute OBJECT PROPERTIES (algebraic invariants)
+            # These enable rules like "red objects → blue" or "leftmost → grows"
+            color_value = None
+            if n_dims > 2:
+                color_value = int(np.round(np.mean(obj_in.points[:, 2])))
+            
+            # Relative position (compared to centroid of all objects)
+            centroid_in = obj_in.centroid[:2] if obj_in.n_dims >= 2 else obj_in.centroid
+            all_centroids = [o.centroid[:2] for o in objs_in if o.n_dims >= 2]
+            if len(all_centroids) > 1:
+                global_center = np.mean(all_centroids, axis=0)
+                rel_pos = centroid_in - global_center
+                position_class = (
+                    'LEFT' if rel_pos[0] < -0.5 else 'RIGHT' if rel_pos[0] > 0.5 else 'CENTER_H',
+                    'TOP' if rel_pos[1] < -0.5 else 'BOTTOM' if rel_pos[1] > 0.5 else 'CENTER_V'
+                )
+            else:
+                position_class = ('SINGLE', 'SINGLE')
+            
             features = {
                 'n_points': obj_in.n_points,
                 'continuous_dims': continuous_dims,
-                'discrete_dims': discrete_dims
+                'discrete_dims': discrete_dims,
+                'color': color_value,
+                'position': position_class,
+                'mass': obj_in.n_points
             }
             
             observations.append({
@@ -1639,10 +1661,16 @@ def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[
         
         n_points_arr = np.array([f['n_points'] for f in data['obs']])
         
+        # Extract color patterns from this group
+        colors_in = [f.get('color') for f in data['obs'] if f.get('color') is not None]
+        positions = [f.get('position') for f in data['obs'] if f.get('position') is not None]
+        
         group_profiles[sig] = {
             'count': len(data['obs']),
             'n_points_mean': float(n_points_arr.mean()),
-            'transform_type': sig
+            'transform_type': sig,
+            'colors': list(set(colors_in)) if colors_in else [],
+            'positions': list(set(positions)) if positions else []
         }
     
     # Compute dominant extent_ratio (most common)
@@ -1665,7 +1693,7 @@ def match_object_to_group(obj_features: Dict, group_profiles: Dict) -> Optional[
     """
     Match an object to the best causal group based on feature similarity.
     
-    Uses n_points as primary matching criterion.
+    Uses n_points, color, and position for matching.
     Returns the transformation signature for the best matching group.
     """
     if not group_profiles:
@@ -1675,15 +1703,39 @@ def match_object_to_group(obj_features: Dict, group_profiles: Dict) -> Optional[
     best_score = float('inf')
     
     obj_n = obj_features['n_points']
+    obj_color = obj_features.get('color')
+    obj_pos = obj_features.get('position')
     
     for sig, profile in group_profiles.items():
         n_mean = profile['n_points_mean']
+        profile_colors = profile.get('colors', [])
+        profile_positions = profile.get('positions', [])
         
-        # Distance as deviation from group mean (relative)
+        # Compute match score (lower = better)
+        # n_points deviation (relative)
         n_dev = abs(obj_n - n_mean) / max(n_mean, 1)
         
-        if n_dev < best_score:
-            best_score = n_dev
+        # Color match bonus (if color matches group colors, reduce score)
+        color_match = 1.0
+        if obj_color is not None and profile_colors:
+            if obj_color in profile_colors:
+                color_match = 0.0  # Perfect match
+            else:
+                color_match = 0.5  # Partial penalty
+        
+        # Position match bonus
+        pos_match = 1.0
+        if obj_pos is not None and profile_positions:
+            if obj_pos in profile_positions:
+                pos_match = 0.0
+            else:
+                pos_match = 0.3
+        
+        # Combined score: weight n_points heavily, color and position as bonuses
+        total_score = n_dev + 0.3 * color_match + 0.2 * pos_match
+        
+        if total_score < best_score:
+            best_score = total_score
             best_sig = sig
     
     return best_sig
@@ -1772,10 +1824,31 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
     
     for obj in test_objs:
         
+        # Compute same properties as training for matching
+        color_value = None
+        if obj.n_dims > 2:
+            color_value = int(np.round(np.mean(obj.points[:, 2])))
+        
+        # Relative position among test objects
+        centroid = obj.centroid[:2] if obj.n_dims >= 2 else obj.centroid
+        all_test_centroids = [o.centroid[:2] for o in test_objs if o.n_dims >= 2]
+        if len(all_test_centroids) > 1:
+            global_center = np.mean(all_test_centroids, axis=0)
+            rel_pos = centroid - global_center
+            position_class = (
+                'LEFT' if rel_pos[0] < -0.5 else 'RIGHT' if rel_pos[0] > 0.5 else 'CENTER_H',
+                'TOP' if rel_pos[1] < -0.5 else 'BOTTOM' if rel_pos[1] > 0.5 else 'CENTER_V'
+            )
+        else:
+            position_class = ('SINGLE', 'SINGLE')
+        
         obj_features = {
             'n_points': obj.n_points,
             'continuous_dims': continuous_dims,
-            'discrete_dims': discrete_dims
+            'discrete_dims': discrete_dims,
+            'color': color_value,
+            'position': position_class,
+            'mass': obj.n_points
         }
         
         # Match to group

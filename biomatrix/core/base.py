@@ -355,3 +355,85 @@ def unify_solutions(derived_ops: List[Operator], pairs: List[Tuple['State', 'Sta
         'verified': verified if pairs else None,
         'generalizes': structural_unified and all(verified) if pairs else structural_unified,
     }
+
+
+def extract_parameters(op: Operator) -> dict:
+    """
+    Extract numeric parameters from an operator.
+    For ARC: analyze what varies between training pairs.
+    
+    Returns dict of parameter names -> values.
+    """
+    params = {}
+    
+    # AffineTransform
+    if hasattr(op, 'translation') and op.translation is not None:
+        import numpy as np
+        params['translation'] = op.translation.tolist() if hasattr(op.translation, 'tolist') else list(op.translation)
+    
+    if hasattr(op, 'linear') and op.linear is not None:
+        import numpy as np
+        params['linear_det'] = float(np.linalg.det(op.linear))
+    
+    # LiftedTransform
+    if hasattr(op, 'lift') and op.lift is not None:
+        params['lifter'] = op.lift.lifter if hasattr(op.lift, 'lifter') else None
+    
+    if hasattr(op, 'bijection') and op.bijection is not None:
+        if hasattr(op.bijection, 'translation') and op.bijection.translation is not None:
+            import numpy as np
+            t = op.bijection.translation
+            params['bijection_translation_norm'] = float(np.linalg.norm(t))
+    
+    # Tiling
+    if hasattr(op, 'translations') and op.translations is not None:
+        params['n_tiles'] = len(op.translations)
+    
+    if hasattr(op, 'count'):
+        params['count'] = op.count
+    
+    # Selection
+    if hasattr(op, 'dim'):
+        params['dim'] = op.dim
+    if hasattr(op, 'value'):
+        params['value'] = op.value
+    
+    # Union/Composition
+    if hasattr(op, 'operands'):
+        params['n_operands'] = len(op.operands)
+    if hasattr(op, 'steps'):
+        params['n_steps'] = len(op.steps)
+    
+    return params
+
+
+def compare_parameters(ops: List[Operator]) -> dict:
+    """
+    Compare parameters across multiple operators.
+    Returns which parameters are constant vs varying.
+    
+    For ARC: identify what's invariant across training pairs.
+    """
+    if not ops:
+        return {'constant': {}, 'varying': {}}
+    
+    all_params = [extract_parameters(op) for op in ops]
+    
+    # Find all parameter keys
+    all_keys = set()
+    for p in all_params:
+        all_keys.update(p.keys())
+    
+    constant = {}
+    varying = {}
+    
+    for key in all_keys:
+        values = [p.get(key) for p in all_params]
+        # Check if all values are equal
+        first = values[0]
+        if all(v == first for v in values):
+            constant[key] = first
+        else:
+            varying[key] = values
+    
+    return {'constant': constant, 'varying': varying}

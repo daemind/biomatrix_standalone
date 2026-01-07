@@ -1066,6 +1066,163 @@ def solve_arc_semantically(training_pairs: List[Tuple['State', 'State']],
     return predicted, explanation
 
 
+def unify_rules_across_pairs(training_pairs: List[Tuple['State', 'State']],
+                              grid_shape: Tuple[int, int] = None) -> Dict[str, Any]:
+    """
+    Find generalizable patterns across ALL training pairs.
+    
+    The key insight for ARC: rules may have different VALUES per pair,
+    but same STRUCTURE. We need to find:
+    1. Which rule TYPES are consistent across pairs
+    2. What META-PATTERN governs the parameter changes
+    """
+    all_rules = []
+    
+    # Derive rules from each pair
+    for i, (s_in, s_out) in enumerate(training_pairs):
+        rules = derive_semantic_rules(s_in, s_out, grid_shape)
+        all_rules.append({'pair': i, 'rules': rules})
+    
+    # Find structural commonality
+    analysis = {
+        'n_pairs': len(training_pairs),
+        'rule_types': {},
+        'structural_consistency': {},
+        'meta_pattern': None,
+        'explanation': []
+    }
+    
+    # Count rule type occurrences
+    for pair_info in all_rules:
+        for rule in pair_info['rules']:
+            action = rule.action
+            if action not in analysis['rule_types']:
+                analysis['rule_types'][action] = {'count': 0, 'pairs': [], 'params': []}
+            analysis['rule_types'][action]['count'] += 1
+            analysis['rule_types'][action]['pairs'].append(pair_info['pair'])
+            analysis['rule_types'][action]['params'].append(rule.params)
+    
+    # Analyze structural consistency
+    n_pairs = len(training_pairs)
+    for action, info in analysis['rule_types'].items():
+        # Rule appears in all pairs?
+        appears_in_all = len(set(info['pairs'])) == n_pairs
+        analysis['structural_consistency'][action] = {
+            'universal': appears_in_all,
+            'coverage': len(set(info['pairs'])) / n_pairs
+        }
+    
+    # Try to find meta-pattern for color changes
+    if 'PERMUTE' in analysis['rule_types']:
+        color_rules = analysis['rule_types']['PERMUTE']
+        
+        # Analyze all color mappings
+        all_color_changes = []
+        for params in color_rules['params']:
+            if 'changes' in params:
+                for colors_in, colors_out in params['changes']:
+                    for c_in, c_out in zip(colors_in, colors_out):
+                        all_color_changes.append((float(c_in), float(c_out)))
+        
+        # Look for patterns in the color mappings
+        if all_color_changes:
+            # Check if there's a consistent function f(c_in) = c_out
+            diffs = [c_out - c_in for c_in, c_out in all_color_changes]
+            
+            # All same diff? (constant offset)
+            if len(set(diffs)) == 1:
+                analysis['meta_pattern'] = {
+                    'type': 'constant_offset',
+                    'offset': diffs[0]
+                }
+                analysis['explanation'].append(
+                    f"Color rule: c_out = c_in + {diffs[0]} (constant offset)"
+                )
+            
+            # All same modulo operation?
+            elif all(d % 10 == diffs[0] % 10 for d in diffs):
+                analysis['meta_pattern'] = {
+                    'type': 'modular',
+                    'base': 10,
+                    'offset_mod': diffs[0] % 10
+                }
+                analysis['explanation'].append(
+                    f"Color rule: c_out = c_in + k (mod 10) pattern"
+                )
+            
+            else:
+                # No simple pattern - context-dependent
+                analysis['meta_pattern'] = {
+                    'type': 'context_dependent',
+                    'requires': 'object context analysis'
+                }
+                analysis['explanation'].append(
+                    "Color mapping is context-dependent (no universal formula)"
+                )
+                
+                # Analyze by object position/context
+                # This is where the semantic graph really helps!
+                analysis['explanation'].append(
+                    "Need to analyze: which object property determines the color mapping?"
+                )
+    
+    # Generate summary
+    universal_rules = [
+        action for action, cons in analysis['structural_consistency'].items()
+        if cons['universal']
+    ]
+    
+    analysis['summary'] = {
+        'universal_rule_types': universal_rules,
+        'generalization_strategy': 'meta_pattern' if analysis['meta_pattern'] else 'structural_only',
+        'confidence': 'high' if universal_rules else 'low'
+    }
+    
+    return analysis
+
+
+def explain_cross_pair_generalization(training_pairs: List[Tuple['State', 'State']],
+                                       grid_shape: Tuple[int, int] = None) -> str:
+    """
+    Explain how the transformation generalizes across training pairs.
+    """
+    analysis = unify_rules_across_pairs(training_pairs, grid_shape)
+    
+    lines = ["=" * 60]
+    lines.append("CROSS-PAIR GENERALIZATION ANALYSIS")
+    lines.append("=" * 60)
+    lines.append(f"\nAnalyzed {analysis['n_pairs']} training pairs.\n")
+    
+    lines.append("Rule Type Frequency:")
+    for action, info in analysis['rule_types'].items():
+        cons = analysis['structural_consistency'][action]
+        status = "✓ Universal" if cons['universal'] else f"Partial ({cons['coverage']:.0%})"
+        lines.append(f"  • {action}: {status}")
+    
+    lines.append("\nMeta-Pattern Analysis:")
+    if analysis['meta_pattern']:
+        mp = analysis['meta_pattern']
+        lines.append(f"  Type: {mp['type']}")
+        for k, v in mp.items():
+            if k != 'type':
+                lines.append(f"  {k}: {v}")
+    else:
+        lines.append("  No universal meta-pattern found")
+    
+    lines.append("\nExplanation:")
+    for exp in analysis['explanation']:
+        lines.append(f"  → {exp}")
+    
+    lines.append("\nGeneralization Summary:")
+    summary = analysis['summary']
+    lines.append(f"  Universal rule types: {summary['universal_rule_types']}")
+    lines.append(f"  Strategy: {summary['generalization_strategy']}")
+    lines.append(f"  Confidence: {summary['confidence']}")
+    
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
 # Export
 __all__ = [
     'ConceptType', 'RelationType', 'Concept', 'Relation', 
@@ -1074,5 +1231,6 @@ __all__ = [
     'ObjectContext', 'compute_object_relations', 'build_scene_graph',
     'explain_scene', 'explain_transformation', 'explain_arc_solution',
     'SemanticRule', 'derive_semantic_rules', 'explain_semantic_resolution',
-    'apply_semantic_rules', 'solve_arc_semantically'
+    'apply_semantic_rules', 'solve_arc_semantically',
+    'unify_rules_across_pairs', 'explain_cross_pair_generalization'
 ]

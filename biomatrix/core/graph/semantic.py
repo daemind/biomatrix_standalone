@@ -742,11 +742,240 @@ def explain_arc_solution(s_in: 'State', s_out: 'State', operator: 'Operator' = N
     return "\n".join(lines)
 
 
+@dataclass
+class SemanticRule:
+    """
+    A rule inferred from comparing input/output scene graphs.
+    
+    This is the semantic/algebraic representation of the transformation:
+    - source: what to match
+    - action: what to do
+    - target: where to apply
+    - condition: when to apply (optional)
+    """
+    source: str           # e.g., "object with pattern=filled_rect"
+    action: str           # e.g., "color_permute", "translate", "copy"
+    target: str           # e.g., "all objects", "object.color"
+    condition: str = ""   # e.g., "if context=corner"
+    params: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_natural_language(self) -> str:
+        """Generate human-readable rule."""
+        if self.condition:
+            return f"For {self.source} {self.condition}: {self.action} → {self.target}"
+        return f"For {self.source}: {self.action} → {self.target}"
+    
+    def __repr__(self):
+        return f"Rule({self.source} → {self.action} → {self.target})"
+
+
+def derive_object_mapping(objs_in: List['State'], objs_out: List['State']) -> List[Tuple[int, int, dict]]:
+    """
+    Find correspondence between input and output objects.
+    Returns list of (in_idx, out_idx, diff_dict) tuples.
+    """
+    mappings = []
+    
+    for i, obj_in in enumerate(objs_in):
+        best_match = None
+        best_score = -1
+        best_diff = {}
+        
+        for j, obj_out in enumerate(objs_out):
+            score = 0
+            diff = {}
+            
+            # Compare n_points
+            if obj_in.n_points == obj_out.n_points:
+                score += 3
+                diff['mass'] = 'preserved'
+            else:
+                diff['mass'] = ('changed', obj_in.n_points, obj_out.n_points)
+            
+            # Compare spread (shape)
+            spread_in = obj_in.spread[:2] if len(obj_in.spread) >= 2 else obj_in.spread
+            spread_out = obj_out.spread[:2] if len(obj_out.spread) >= 2 else obj_out.spread
+            if np.allclose(spread_in, spread_out, atol=0.1):
+                score += 2
+                diff['shape'] = 'preserved'
+            else:
+                diff['shape'] = ('changed', spread_in.tolist(), spread_out.tolist())
+            
+            # Compare position (centroid offset)
+            cent_in = obj_in.centroid[:2] if len(obj_in.centroid) >= 2 else obj_in.centroid
+            cent_out = obj_out.centroid[:2] if len(obj_out.centroid) >= 2 else obj_out.centroid
+            translation = cent_out - cent_in
+            if np.allclose(translation, 0, atol=0.1):
+                score += 1
+                diff['position'] = 'same'
+            else:
+                diff['position'] = ('translated', translation.tolist())
+            
+            # Compare color distribution
+            if obj_in.n_dims >= 3 and obj_out.n_dims >= 3:
+                colors_in = set(np.round(obj_in.points[:, 2], 0))
+                colors_out = set(np.round(obj_out.points[:, 2], 0))
+                if colors_in == colors_out:
+                    score += 2
+                    diff['color'] = 'preserved'
+                else:
+                    diff['color'] = ('changed', list(colors_in), list(colors_out))
+            
+            if score > best_score:
+                best_score = score
+                best_match = j
+                best_diff = diff
+        
+        if best_match is not None:
+            mappings.append((i, best_match, best_diff))
+    
+    return mappings
+
+
+def derive_semantic_rules(s_in: 'State', s_out: 'State', 
+                          grid_shape: Tuple[int, int] = None) -> List[SemanticRule]:
+    """
+    Derive semantic transformation rules by comparing input/output.
+    
+    This is the key function for algebraic ARC solving:
+    1. Build scene graphs
+    2. Map objects between scenes
+    3. Analyze what changed
+    4. Express as semantic rules
+    """
+    from ..topology import partition_by_connectivity
+    
+    rules = []
+    
+    # Get objects
+    objs_in = partition_by_connectivity(s_in)
+    objs_out = partition_by_connectivity(s_out)
+    
+    # Get mappings
+    mappings = derive_object_mapping(objs_in, objs_out)
+    
+    # Analyze global changes
+    if len(objs_out) == 2 * len(objs_in):
+        rules.append(SemanticRule(
+            source="all objects",
+            action="DUPLICATE",
+            target="scene",
+            params={'factor': 2}
+        ))
+    elif len(objs_out) < len(objs_in):
+        rules.append(SemanticRule(
+            source="some objects",
+            action="FILTER/DELETE",
+            target="scene",
+            params={'removed': len(objs_in) - len(objs_out)}
+        ))
+    
+    # Analyze per-object changes
+    color_changes = []
+    position_changes = []
+    
+    for in_idx, out_idx, diff in mappings:
+        obj_in_ctx = ObjectContext(objs_in[in_idx], grid_shape)
+        
+        # Color change
+        if diff.get('color') and diff['color'] != 'preserved':
+            _, colors_in, colors_out = diff['color']
+            color_changes.append((colors_in, colors_out))
+        
+        # Position change  
+        if diff.get('position') and diff['position'] != 'same':
+            _, translation = diff['position']
+            position_changes.append(translation)
+    
+    # Infer color rule
+    if color_changes:
+        # Check if all color changes follow same pattern
+        if len(set(str(c) for c in color_changes)) == 1:
+            colors_in, colors_out = color_changes[0]
+            rules.append(SemanticRule(
+                source="object.colors",
+                action="PERMUTE",
+                target="all objects uniformly",
+                params={'from': colors_in, 'to': colors_out}
+            ))
+        else:
+            rules.append(SemanticRule(
+                source="object.colors",
+                action="PERMUTE",
+                target="per-object (context-dependent)",
+                params={'changes': color_changes}
+            ))
+    
+    # Infer position rule
+    if position_changes:
+        # Check if all translations are the same
+        translations = [np.array(t) for t in position_changes]
+        if len(translations) > 1 and all(np.allclose(t, translations[0]) for t in translations):
+            rules.append(SemanticRule(
+                source="object.position",
+                action="TRANSLATE",
+                target="all objects uniformly",
+                params={'by': translations[0].tolist()}
+            ))
+        elif position_changes:
+            rules.append(SemanticRule(
+                source="object.position",
+                action="TRANSLATE",
+                target="per-object",
+                params={'translations': position_changes}
+            ))
+    
+    return rules
+
+
+def explain_semantic_resolution(s_in: 'State', s_out: 'State',
+                                grid_shape: Tuple[int, int] = None) -> str:
+    """
+    Full semantic resolution: derive rules and explain them.
+    """
+    rules = derive_semantic_rules(s_in, s_out, grid_shape)
+    
+    lines = ["=" * 50]
+    lines.append("SEMANTIC RESOLUTION")
+    lines.append("=" * 50)
+    lines.append(f"\nDiscovered {len(rules)} transformation rule(s):\n")
+    
+    for i, rule in enumerate(rules, 1):
+        lines.append(f"{i}. {rule.to_natural_language()}")
+        if rule.params:
+            for k, v in rule.params.items():
+                lines.append(f"     {k}: {v}")
+        lines.append("")
+    
+    # Add interpretation
+    lines.append("INTERPRETATION:")
+    if any(r.action == "PERMUTE" for r in rules):
+        lines.append("  → This is a COLOR TRANSFORMATION task")
+        color_rule = next((r for r in rules if r.action == "PERMUTE"), None)
+        if color_rule and color_rule.target == "all objects uniformly":
+            lines.append("  → The same color mapping applies to all objects")
+        else:
+            lines.append("  → Color mapping depends on object context")
+    
+    if any(r.action == "TRANSLATE" for r in rules):
+        lines.append("  → This is a SPATIAL TRANSFORMATION task")
+        
+    if any(r.action == "DUPLICATE" for r in rules):
+        lines.append("  → This is a TILING/REPLICATION task")
+        
+    if any(r.action == "FILTER/DELETE" for r in rules):
+        lines.append("  → This is a SELECTION/FILTERING task")
+    
+    lines.append("=" * 50)
+    return "\n".join(lines)
+
+
 # Export
 __all__ = [
     'ConceptType', 'RelationType', 'Concept', 'Relation', 
     'SemanticGraph', 'extract_semantic_graph',
     'InputPropertyMatcher', 'relativize_operator',
     'ObjectContext', 'compute_object_relations', 'build_scene_graph',
-    'explain_scene', 'explain_transformation', 'explain_arc_solution'
+    'explain_scene', 'explain_transformation', 'explain_arc_solution',
+    'SemanticRule', 'derive_semantic_rules', 'explain_semantic_resolution'
 ]

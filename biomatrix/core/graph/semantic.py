@@ -2275,8 +2275,8 @@ def solve_with_affine_composition(training_pairs: List[Tuple['State', 'State']],
     """
     Unified Affine Primitive Solver.
     
-    Learns affine composition T = Union(T_k) from training,
-    applies to test. Semantics emerge from derived A, b.
+    Learns affine composition T = Union(T_k) from ALL training pairs,
+    finds INVARIANT group structure, applies to test.
     """
     from ..state import State
     from ..operators.affine import GlobalAffineOperator
@@ -2284,13 +2284,38 @@ def solve_with_affine_composition(training_pairs: List[Tuple['State', 'State']],
     if not training_pairs:
         return test_input, "No training pairs"
     
-    # Learn affine composition from first training pair
-    s_in, s_out = training_pairs[0]
-    composition = derive_affine_composition(s_in, s_out)
+    # Analyze ALL training pairs to find common group structure
+    all_compositions = []
+    for s_in, s_out in training_pairs:
+        comp = derive_affine_composition(s_in, s_out)
+        if comp is not None:
+            all_compositions.append(comp)
     
-    # Fallback to causal groups solver if affine composition fails
-    if composition is None:
+    if not all_compositions:
         return solve_arc_with_causal_groups(training_pairs, test_input)
+    
+    # Find INVARIANT group structure (common to all pairs)
+    # The invariant is: same group element types across all pairs
+    if len(all_compositions) > 1:
+        group_structures = [c.get('group_structure', {}) for c in all_compositions]
+        
+        # Check if all pairs have consistent group structure
+        all_match = True
+        ref_types = group_structures[0].get('element_types', {}) if group_structures else {}
+        
+        for gs in group_structures[1:]:
+            other_types = gs.get('element_types', {})
+            # Group is invariant if element type sets match
+            if set(ref_types.keys()) != set(other_types.keys()):
+                all_match = False
+                break
+        
+        if not all_match:
+            # No consistent group across pairs, fallback
+            return solve_arc_with_causal_groups(training_pairs, test_input)
+    
+    # Use first composition (now validated across all pairs)
+    composition = all_compositions[0]
     
     n_dims = test_input.n_dims
     

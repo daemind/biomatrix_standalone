@@ -313,6 +313,33 @@ class BinarySetOperator(Operator):
             result_pts = state_a.points[in_a_only]
         elif self.operation == 'diff_ba':
             result_pts = self.state_b.points[in_b_only]
+        elif self.operation == 'complement_intersection':
+            # NOR: positions that are in neither A nor B
+            # Need to compute the grid extent and find positions not covered
+            all_spatial = np.vstack([a_spatial, b_spatial])
+            min_coords = all_spatial.min(axis=0).astype(int)
+            max_coords = all_spatial.max(axis=0).astype(int)
+            
+            # Generate all grid positions in extent
+            rows = np.arange(min_coords[0], max_coords[0] + 1)
+            cols = np.arange(min_coords[1], max_coords[1] + 1)
+            rr, cc = np.meshgrid(rows, cols, indexing='ij')
+            all_positions = np.stack([rr.ravel(), cc.ravel()], axis=1).astype(np.float64)
+            all_void = view_as_void(all_positions)
+            
+            # Union of A and B
+            union_void = np.unique(np.vstack([va, vb]))
+            nor_mask = ~np.isin(all_void, union_void).flatten()
+            
+            if np.any(nor_mask):
+                result_spatial = all_positions[nor_mask]
+                # Build result with output color
+                if state_a.n_dims > 2:
+                    result_pts = np.hstack([result_spatial, np.full((len(result_spatial), state_a.n_dims - 2), self.output_color)])
+                else:
+                    result_pts = result_spatial
+            else:
+                result_pts = np.empty((0, state_a.n_dims))
         else:
             result_pts = state_a.points
         

@@ -1516,6 +1516,25 @@ def derive_set_operation(s_in: 'State', s_out: 'State') -> Optional[Dict[str, An
                     sd_list.append(b_spatial[in_b_only])
                 results['sym_diff'] = np.vstack(sd_list) if sd_list else np.empty((0, 2))
                 
+                # NOR operation: positions that are NOT in A AND NOT in B
+                # = positions in the grid that are background in BOTH regions
+                # We need the grid extent to compute this
+                all_spatial = np.vstack([a_spatial, b_spatial])
+                min_coords = all_spatial.min(axis=0).astype(int)
+                max_coords = all_spatial.max(axis=0).astype(int)
+                
+                # Generate all grid positions
+                rows = np.arange(min_coords[0], max_coords[0] + 1)
+                cols = np.arange(min_coords[1], max_coords[1] + 1)
+                rr, cc = np.meshgrid(rows, cols, indexing='ij')
+                all_positions = np.stack([rr.ravel(), cc.ravel()], axis=1).astype(np.float64)
+                all_void = view_as_void(all_positions)
+                
+                # NOR = all positions that are in neither A nor B
+                union_void = np.unique(np.vstack([va, vb]))
+                nor_mask = ~np.isin(all_void, union_void).flatten()
+                results['complement_intersection'] = all_positions[nor_mask] if np.any(nor_mask) else np.empty((0, 2))
+                
                 for op_name, result in results.items():
                     if len(result) == 0 or len(result) != len(out_void):
                         continue
@@ -1559,6 +1578,63 @@ def derive_set_operation(s_in: 'State', s_out: 'State') -> Optional[Dict[str, An
         if result:
             result['partition_strategy'] = 'color'
             return result
+    
+    # Strategy 3: Partition by separator (line/column with uniform color)
+    # Detect rows/columns that are uniformly filled with a single color
+    # This partitions the space into regions separated by the separator
+    
+    # Get spatial extent
+    spatial = s_in.points[:, :2]
+    min_coords = spatial.min(axis=0).astype(int)
+    max_coords = spatial.max(axis=0).astype(int)
+    
+    # Check for horizontal separator (same color across row)
+    rows = np.unique(spatial[:, 0].astype(int))
+    for row in rows:
+        row_mask = spatial[:, 0].astype(int) == row
+        row_colors = colors[row_mask]
+        unique = np.unique(row_colors)
+        
+        # Separator: entire row is one color (not background)
+        if len(unique) == 1 and unique[0] > 0:
+            sep_color = unique[0]
+            # Split into above and below
+            above_mask = (spatial[:, 0] < row) & (colors != sep_color)
+            below_mask = (spatial[:, 0] > row) & (colors != sep_color)
+            
+            if np.any(above_mask) and np.any(below_mask):
+                region_above = State(s_in.points[above_mask])
+                region_below = State(s_in.points[below_mask])
+                
+                result = test_partition([region_above, region_below])
+                if result:
+                    result['partition_strategy'] = 'horizontal_separator'
+                    result['separator_row'] = int(row)
+                    result['separator_color'] = int(sep_color)
+                    return result
+    
+    # Check for vertical separator (same color across column)
+    cols = np.unique(spatial[:, 1].astype(int))
+    for col in cols:
+        col_mask = spatial[:, 1].astype(int) == col
+        col_colors = colors[col_mask]
+        unique = np.unique(col_colors)
+        
+        if len(unique) == 1 and unique[0] > 0:
+            sep_color = unique[0]
+            left_mask = (spatial[:, 1] < col) & (colors != sep_color)
+            right_mask = (spatial[:, 1] > col) & (colors != sep_color)
+            
+            if np.any(left_mask) and np.any(right_mask):
+                region_left = State(s_in.points[left_mask])
+                region_right = State(s_in.points[right_mask])
+                
+                result = test_partition([region_left, region_right])
+                if result:
+                    result['partition_strategy'] = 'vertical_separator'
+                    result['separator_col'] = int(col)
+                    result['separator_color'] = int(sep_color)
+                    return result
     
     return None
 def derive_affine_composition(s_in: 'State', s_out: 'State') -> Optional[Dict[str, Any]]:
@@ -2284,7 +2360,120 @@ def solve_with_affine_composition(training_pairs: List[Tuple['State', 'State']],
     if not training_pairs:
         return test_input, "No training pairs"
     
-    # Analyze ALL training pairs to find common group structure
+    # First, try to detect set operations with separator partitioning
+    # This handles XOR-type tasks with spatial partitions
+    all_set_ops = []
+    for s_in, s_out in training_pairs:
+        set_op = derive_set_operation(s_in, s_out)
+        if set_op is not None:
+            all_set_ops.append(set_op)
+    
+    # Check if set operation is consistent across all pairs
+    if len(all_set_ops) == len(training_pairs) and len(all_set_ops) > 0:
+        ref_op = all_set_ops[0]
+        all_same_op = all(op['operation'] == ref_op['operation'] for op in all_set_ops)
+        all_same_strategy = all(op.get('partition_strategy') == ref_op.get('partition_strategy') for op in all_set_ops)
+        
+        if all_same_op and all_same_strategy:
+            from ..topology import partition_by_connectivity
+            from ..operators.logic import BinarySetOperator
+            
+            # Apply same operation to test
+            set_info = ref_op
+            strategy = set_info.get('partition_strategy', 'connectivity')
+            
+            if strategy == 'horizontal_separator':
+                # Find separator in test
+                colors = test_input.points[:, 2]
+                spatial = test_input.points[:, :2]
+                sep_color = set_info.get('separator_color', 0)
+                
+                rows = np.unique(spatial[:, 0].astype(int))
+                for row in rows:
+                    row_mask = spatial[:, 0].astype(int) == row
+                    row_colors = colors[row_mask]
+                    unique = np.unique(row_colors)
+                    
+                    if len(unique) == 1 and unique[0] == sep_color:
+                        above_mask = (spatial[:, 0] < row) & (colors != sep_color)
+                        below_mask = (spatial[:, 0] > row) & (colors != sep_color)
+                        
+                        if np.any(above_mask) and np.any(below_mask):
+                            region_above = State(test_input.points[above_mask])
+                            region_below_pts = test_input.points[below_mask].copy()
+                            
+                            # Normalize region_below to same origin as region_above
+                            # So positions can be compared correctly
+                            above_min = region_above.points[:, 0].min()
+                            below_min = region_below_pts[:, 0].min()
+                            region_below_pts[:, 0] -= (below_min - above_min)
+                            region_below = State(region_below_pts)
+                            
+                            set_op = BinarySetOperator(
+                                operation=set_info['operation'],
+                                state_b=region_below,
+                                output_color=set_info['output_color']
+                            )
+                            predicted = set_op.apply(region_above)
+                            
+                            return predicted, f"SET OPERATION via {strategy}\nOp: {set_info['operation']}, Color: {set_info['output_color']}"
+            
+            elif strategy == 'vertical_separator':
+                colors = test_input.points[:, 2]
+                spatial = test_input.points[:, :2]
+                sep_color = set_info.get('separator_color', 0)
+                
+                cols = np.unique(spatial[:, 1].astype(int))
+                for col in cols:
+                    col_mask = spatial[:, 1].astype(int) == col
+                    col_colors = colors[col_mask]
+                    unique = np.unique(col_colors)
+                    
+                    if len(unique) == 1 and unique[0] == sep_color:
+                        left_mask = (spatial[:, 1] < col) & (colors != sep_color)
+                        right_mask = (spatial[:, 1] > col) & (colors != sep_color)
+                        
+                        if np.any(left_mask) and np.any(right_mask):
+                            region_left = State(test_input.points[left_mask])
+                            region_right_pts = test_input.points[right_mask].copy()
+                            
+                            # Normalize region_right to same origin as region_left
+                            left_min = region_left.points[:, 1].min()
+                            right_min = region_right_pts[:, 1].min()
+                            region_right_pts[:, 1] -= (right_min - left_min)
+                            region_right = State(region_right_pts)
+                            
+                            set_op = BinarySetOperator(
+                                operation=set_info['operation'],
+                                state_b=region_right,
+                                output_color=set_info['output_color']
+                            )
+                            predicted = set_op.apply(region_left)
+                            
+                            return predicted, f"SET OPERATION via {strategy}\nOp: {set_info['operation']}, Color: {set_info['output_color']}"
+            
+            else:
+                # Generic: use connectivity partitioning
+                test_components = partition_by_connectivity(test_input)
+                
+                if len(test_components) >= 2:
+                    idx_a = set_info['component_a_idx']
+                    idx_b = set_info['component_b_idx']
+                    
+                    if idx_a < len(test_components) and idx_b < len(test_components):
+                        comp_a = test_components[idx_a]
+                        comp_b = test_components[idx_b]
+                        
+                        set_op = BinarySetOperator(
+                            operation=set_info['operation'],
+                            state_b=comp_b,
+                            output_color=set_info['output_color']
+                        )
+                        predicted = set_op.apply(comp_a)
+                        
+                        return predicted, f"SET OPERATION\nOp: {set_info['operation']}, Color: {set_info['output_color']}"
+    
+    # Analyze ALL training pairs to find common affine group structure
     all_compositions = []
     for s_in, s_out in training_pairs:
         comp = derive_affine_composition(s_in, s_out)

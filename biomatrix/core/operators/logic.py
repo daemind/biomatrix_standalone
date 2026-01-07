@@ -318,6 +318,12 @@ class PartitionOperator(Operator):
         
         all_pts = np.vstack(valid_pts)
         return State(np.unique(all_pts, axis=0))
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        n = len(self.operands)
+        return f"⊔_{self.strategy}({n})"
 
 
 @dataclass
@@ -377,6 +383,13 @@ class ComponentMapOperator(Operator):
             return State(np.empty((0, state.n_dims)))
         
         return State(np.vstack(valid_pts))
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        n = len(self.mapping) if self.mapping else 1
+        inner = self.operator.to_symbolic() if self.operator and hasattr(self.operator, 'to_symbolic') else "op"
+        return f"⋃_{n}({inner})"
 
 
 
@@ -396,6 +409,12 @@ class CausalityOperator(Operator):
         # But wait, State is immutable-ish (dataclass).
         # We can use the copy constructor logic we added.
         return State(res.points, causality_score=self.score)
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        inner = self.operator.to_symbolic() if hasattr(self.operator, 'to_symbolic') else type(self.operator).__name__
+        return f"C({inner}, {self.score:.1f})"
 
 
 # Export all

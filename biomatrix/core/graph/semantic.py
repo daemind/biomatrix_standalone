@@ -1697,6 +1697,35 @@ def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[
     dominant_extent_ratio = max(set(global_extent_ratios), key=global_extent_ratios.count) if global_extent_ratios else (1.0, 1.0)
     is_shape_change = any(r != 1.0 for r in dominant_extent_ratio)
     
+    # DERIVE EXPLICIT RULES from observations
+    # Rule = (predicate, transformation) where predicate is a dict of property conditions
+    rules = []
+    for sig, data in groups.items():
+        if not data['obs']:
+            continue
+        
+        # Find common properties for this transformation type
+        colors = [f.get('color') for f in data['obs'] if f.get('color') is not None]
+        shapes = [f.get('shape') for f in data['obs'] if f.get('shape') is not None]
+        positions = [f.get('position') for f in data['obs'] if f.get('position') is not None]
+        sizes = [f.get('size_class') for f in data['obs'] if f.get('size_class') is not None]
+        
+        # If property is consistent across observations, it becomes a predicate
+        predicate = {}
+        if len(set(colors)) == 1 and colors:
+            predicate['color'] = colors[0]
+        if len(set(shapes)) == 1 and shapes:
+            predicate['shape'] = shapes[0]
+        if len(set(sizes)) == 1 and sizes:
+            predicate['size_class'] = sizes[0]
+        
+        if predicate:  # Only create rule if there's a distinguishing predicate
+            rules.append({
+                'predicate': predicate,
+                'transformation': sig,
+                'chromatic_map': data.get('chromatic', {})
+            })
+    
     return {
         'groups': groups,
         'profiles': group_profiles,
@@ -1705,9 +1734,51 @@ def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[
         'chromatic_bijection': chromatic_bijections,
         'extent_ratio': dominant_extent_ratio,
         'is_shape_change': is_shape_change,
-        'periodicity_detected': any(obs.get('periodicity', False) for pair in training_pairs for obs in [])  # TODO: implement properly
+        'rules': rules,  # Explicit IF-THEN rules
+        'periodicity_detected': any(obs.get('periodicity', False) for pair in training_pairs for obs in [])
     }
 
+
+def explain_rules(rules: List[Dict]) -> str:
+    """
+    Generate human-readable explanation of derived rules.
+    
+    Returns a string like:
+    "Rule 1: IF color=3 AND shape=TALL THEN apply CHROMATIC transformation"
+    """
+    lines = []
+    for i, rule in enumerate(rules, 1):
+        pred = rule['predicate']
+        trans = rule['transformation']
+        
+        # Build predicate string
+        conditions = []
+        if 'color' in pred:
+            conditions.append(f"color={pred['color']}")
+        if 'shape' in pred:
+            conditions.append(f"shape={pred['shape']}")
+        if 'size_class' in pred:
+            conditions.append(f"size={pred['size_class']}")
+        if 'position' in pred:
+            conditions.append(f"position={pred['position']}")
+        
+        pred_str = " AND ".join(conditions) if conditions else "ANY"
+        
+        # Build transformation string
+        spatial_t, chromatic_t, size_t = trans
+        trans_parts = []
+        if spatial_t != 'STATIC':
+            trans_parts.append(f"move ({spatial_t})")
+        if chromatic_t != 'PRESERVE':
+            trans_parts.append(f"recolor ({chromatic_t})")
+        if size_t != 'SAME':
+            trans_parts.append(f"resize ({size_t})")
+        
+        trans_str = " + ".join(trans_parts) if trans_parts else "identity"
+        
+        lines.append(f"Rule {i}: IF {pred_str} THEN {trans_str}")
+    
+    return "\n".join(lines) if lines else "No explicit rules derived"
 
 def match_object_to_group(obj_features: Dict, group_profiles: Dict) -> Optional[Tuple]:
     """
@@ -1936,6 +2007,13 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
     lines.append("=" * 60)
     lines.append(f"\nDetected {detected['n_groups']} causal groups")
     lines.append(f"Global chromatic bijection: {chromatic_bijection}")
+    
+    # Add derived rules explanation
+    rules = detected.get('rules', [])
+    if rules:
+        lines.append("\n--- DERIVED RULES ---")
+        lines.append(explain_rules(rules))
+    
     lines.append("\nApplied to test:")
     for a in applied[:5]:
         lines.append(f"  type={a['type']}, chromatic_applied={a['chromatic_applied']}")

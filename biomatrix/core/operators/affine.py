@@ -38,6 +38,9 @@ class ValueProjectionOperator(Operator):
         new_points[:, self.dim] = self.value
         
         return State(points=new_points)
+    
+    def to_symbolic(self) -> str:
+        return f"π_d{self.dim}={self.value:.0f}"
 
 
 @dataclass
@@ -92,6 +95,10 @@ class ScaleOperator(Operator):
         new_points = scaled + self.centroid_out
         
         return State(new_points)
+    
+    def to_symbolic(self) -> str:
+        s = ",".join(f"{v:.1f}" for v in self.scale_factors[:3])
+        return f"S({s})"
 
 
 @dataclass
@@ -140,6 +147,10 @@ class PermutationOperator(Operator):
         
         new_points = state.points[:, self.perm]
         return State(new_points)
+    
+    def to_symbolic(self) -> str:
+        p = ",".join(str(i) for i in self.perm)
+        return f"P({p})"
 
 
 @dataclass
@@ -308,6 +319,10 @@ class AffineTiling(Operator):
             result_pts.append(pts)
         
         return State(np.vstack(result_pts))
+    
+    def to_symbolic(self) -> str:
+        n = len(self.translations)
+        return f"ATile({n})"
     
     def __repr__(self):
         return f"AffineTiling(M={self.matrix.shape}, |T|={len(self.translations)})"

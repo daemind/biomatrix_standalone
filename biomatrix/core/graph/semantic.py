@@ -1459,9 +1459,19 @@ def derive_affine_composition(s_in: 'State', s_out: 'State') -> Optional[Dict[st
             if len(tile_out) != n_in:
                 continue  # Skip incomplete tiles
             
-            # Match to input via Hungarian
-            dists = cdist(s_in.points[:, :n_dims], tile_out)
-            row_ind, col_ind = linear_sum_assignment(dists)
+            # Match to input via Hungarian with COLOR-weighted distance
+            # Color must match exactly, spatial can vary
+            spatial_dists = cdist(s_in.points[:, :2], tile_out[:, :2])
+            
+            # Color distance (high weight = must match)
+            if n_dims > 2:
+                color_dists = cdist(s_in.points[:, 2:], tile_out[:, 2:])
+                # Color mismatch = very high penalty
+                total_dists = spatial_dists + 1000 * color_dists
+            else:
+                total_dists = spatial_dists
+            
+            row_ind, col_ind = linear_sum_assignment(total_dists)
             
             X = s_in.points[row_ind, :n_dims]
             Y = tile_out[col_ind]

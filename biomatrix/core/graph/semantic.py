@@ -1311,6 +1311,117 @@ def solve_arc_with_global_mapping(training_pairs: List[Tuple['State', 'State']],
     return predicted, explanation
 
 
+def learn_context_mapping(training_pairs: List[Tuple['State', 'State']]) -> Dict[str, Any]:
+    """
+    Learn context-aware mapping: (color, object_properties) → output_color.
+    
+    When simple bijection has conflicts, the mapping depends on object context.
+    Key: (color, binned_size) → output_color
+    """
+    from ..topology import partition_by_connectivity
+    
+    # Context-aware map: (color, size_bin) → output_color
+    context_map = {}
+    simple_map = {}
+    
+    def size_bin(n_points):
+        """Bin sizes into categories."""
+        if n_points <= 5:
+            return 'tiny'
+        elif n_points <= 15:
+            return 'small'
+        elif n_points <= 30:
+            return 'medium'
+        else:
+            return 'large'
+    
+    for pair_idx, (s_in, s_out) in enumerate(training_pairs):
+        objs_in = partition_by_connectivity(s_in)
+        objs_out = partition_by_connectivity(s_out)
+        
+        for obj_in, obj_out in zip(objs_in, objs_out):
+            if obj_in.n_dims >= 3 and obj_out.n_dims >= 3:
+                c_in = float(np.round(obj_in.points[0, 2], 0))
+                c_out = float(np.round(obj_out.points[0, 2], 0))
+                
+                if c_in != c_out:
+                    # Simple map
+                    simple_map[c_in] = c_out
+                    
+                    # Context-aware map
+                    key = (c_in, size_bin(obj_in.n_points))
+                    context_map[key] = c_out
+    
+    return {
+        'simple_map': simple_map,
+        'context_map': context_map,
+        'use_context': len(context_map) > len(simple_map)
+    }
+
+
+def solve_arc_context_aware(training_pairs: List[Tuple['State', 'State']],
+                             test_input: 'State') -> Tuple['State', str]:
+    """
+    Solve ARC using context-aware mapping.
+    
+    Falls back to simple bijection if no context-dependence detected.
+    """
+    from ..topology import partition_by_connectivity
+    from ..state import State
+    
+    learned = learn_context_mapping(training_pairs)
+    
+    def size_bin(n_points):
+        if n_points <= 5:
+            return 'tiny'
+        elif n_points <= 15:
+            return 'small'
+        elif n_points <= 30:
+            return 'medium'
+        else:
+            return 'large'
+    
+    # Partition test input
+    test_objs = partition_by_connectivity(test_input)
+    
+    result_points = test_input.points.copy()
+    
+    # Apply mapping per object
+    obj_start = 0
+    for obj in test_objs:
+        if obj.n_dims >= 3:
+            c_in = float(np.round(obj.points[0, 2], 0))
+            
+            # Try context-aware first
+            key = (c_in, size_bin(obj.n_points))
+            if key in learned['context_map']:
+                c_out = learned['context_map'][key]
+            elif c_in in learned['simple_map']:
+                c_out = learned['simple_map'][c_in]
+            else:
+                c_out = c_in  # Keep original
+            
+            # Apply to all points of this object
+            for i in range(obj_start, obj_start + obj.n_points):
+                if i < len(result_points):
+                    result_points[i, 2] = c_out
+        
+        obj_start += obj.n_points
+    
+    predicted = State(result_points)
+    
+    # Explanation
+    lines = ["=" * 60]
+    lines.append("CONTEXT-AWARE SOLUTION")
+    lines.append("=" * 60)
+    lines.append(f"\nContext mappings learned: {len(learned['context_map'])}")
+    for (c, size), c_out in sorted(learned['context_map'].items()):
+        lines.append(f"  ({int(c)}, {size}) → {int(c_out)}")
+    lines.append("=" * 60)
+    
+    return predicted, "\n".join(lines)
+
+
 # Export
 __all__ = [
     'ConceptType', 'RelationType', 'Concept', 'Relation', 
@@ -1321,5 +1432,6 @@ __all__ = [
     'SemanticRule', 'derive_semantic_rules', 'explain_semantic_resolution',
     'apply_semantic_rules', 'solve_arc_semantically',
     'unify_rules_across_pairs', 'explain_cross_pair_generalization',
-    'learn_global_mapping', 'solve_arc_with_global_mapping'
+    'learn_global_mapping', 'solve_arc_with_global_mapping',
+    'learn_context_mapping', 'solve_arc_context_aware'
 ]

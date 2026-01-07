@@ -1223,6 +1223,94 @@ def explain_cross_pair_generalization(training_pairs: List[Tuple['State', 'State
     return "\n".join(lines)
 
 
+def learn_global_mapping(training_pairs: List[Tuple['State', 'State']]) -> Dict[str, Any]:
+    """
+    Learn global mapping from UNION of all training pairs.
+    
+    KEY INSIGHT: Each pair provides PART of the global rule.
+    Generalization = UNION, not intersection.
+    """
+    from ..topology import partition_by_connectivity
+    
+    global_color_map = {}
+    conflicts = []
+    
+    for pair_idx, (s_in, s_out) in enumerate(training_pairs):
+        objs_in = partition_by_connectivity(s_in)
+        objs_out = partition_by_connectivity(s_out)
+        
+        for obj_in, obj_out in zip(objs_in, objs_out):
+            # Get unique colors per object
+            if obj_in.n_dims >= 3 and obj_out.n_dims >= 3:
+                c_in = float(np.round(obj_in.points[0, 2], 0))
+                c_out = float(np.round(obj_out.points[0, 2], 0))
+                
+                if c_in not in global_color_map:
+                    global_color_map[c_in] = c_out
+                elif global_color_map[c_in] != c_out:
+                    conflicts.append({
+                        'pair': pair_idx,
+                        'color': c_in,
+                        'existing': global_color_map[c_in],
+                        'new': c_out
+                    })
+    
+    return {
+        'color_map': global_color_map,
+        'conflicts': conflicts,
+        'is_consistent': len(conflicts) == 0,
+        'coverage': len(global_color_map)
+    }
+
+
+def solve_arc_with_global_mapping(training_pairs: List[Tuple['State', 'State']],
+                                   test_input: 'State') -> Tuple['State', str]:
+    """
+    Solve ARC using global mapping learned from UNION of all pairs.
+    
+    This is the correct generalization approach:
+    - Learn color map from ALL pairs (union, not intersection)
+    - Apply to test
+    """
+    from ..state import State
+    
+    # Learn global mapping
+    learned = learn_global_mapping(training_pairs)
+    color_map = learned['color_map']
+    
+    # Apply to test
+    result_points = test_input.points.copy()
+    
+    if test_input.n_dims >= 3:
+        for i in range(len(result_points)):
+            old_color = float(np.round(result_points[i, 2], 0))
+            if old_color in color_map:
+                result_points[i, 2] = color_map[old_color]
+    
+    predicted = State(result_points)
+    
+    # Generate explanation
+    lines = ["=" * 60]
+    lines.append("GLOBAL MAPPING SOLUTION")
+    lines.append("=" * 60)
+    lines.append(f"\nLearned from {len(training_pairs)} training pairs (UNION approach).")
+    lines.append(f"\nGlobal Color Mapping ({learned['coverage']} colors):")
+    for c_in in sorted(color_map.keys()):
+        lines.append(f"  {int(c_in)} → {int(color_map[c_in])}")
+    
+    if learned['conflicts']:
+        lines.append(f"\n⚠ Conflicts detected: {len(learned['conflicts'])}")
+        for c in learned['conflicts']:
+            lines.append(f"  Pair {c['pair']}: {c['color']} → {c['new']} vs {c['existing']}")
+    else:
+        lines.append("\n✓ No conflicts - mapping is consistent!")
+    
+    lines.append("=" * 60)
+    explanation = "\n".join(lines)
+    
+    return predicted, explanation
+
+
 # Export
 __all__ = [
     'ConceptType', 'RelationType', 'Concept', 'Relation', 
@@ -1232,5 +1320,6 @@ __all__ = [
     'explain_scene', 'explain_transformation', 'explain_arc_solution',
     'SemanticRule', 'derive_semantic_rules', 'explain_semantic_resolution',
     'apply_semantic_rules', 'solve_arc_semantically',
-    'unify_rules_across_pairs', 'explain_cross_pair_generalization'
+    'unify_rules_across_pairs', 'explain_cross_pair_generalization',
+    'learn_global_mapping', 'solve_arc_with_global_mapping'
 ]

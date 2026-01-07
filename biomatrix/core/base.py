@@ -195,3 +195,72 @@ class SequentialOperator(Operator):
         
     def __repr__(self) -> str:
         return " @ ".join([repr(op) for op in reversed(self.steps)])
+
+
+# === Operator Analysis Utilities ===
+
+def commutes(op1: Operator, op2: Operator, test_state: 'State' = None) -> bool:
+    """Check if op1 ∘ op2 = op2 ∘ op1 (approximately, via test state)."""
+    if test_state is None:
+        # Generate a small test state
+        import numpy as np
+        test_state = __import__('biomatrix.core.state', fromlist=['State']).State(
+            np.random.rand(10, 3) * 10
+        )
+    
+    result_12 = op1.apply(op2.apply(test_state))
+    result_21 = op2.apply(op1.apply(test_state))
+    
+    if result_12.n_points != result_21.n_points:
+        return False
+    
+    # Compare point sets (order-independent)
+    import numpy as np
+    pts_12 = np.sort(result_12.points, axis=0)
+    pts_21 = np.sort(result_21.points, axis=0)
+    
+    return np.allclose(pts_12, pts_21, atol=1e-6)
+
+
+def analyze_composition(ops: List[Operator]) -> dict:
+    """Analyze a sequence of operators for composition properties."""
+    if not ops:
+        return {'empty': True}
+    
+    categories = [op.category for op in ops]
+    
+    return {
+        'n_ops': len(ops),
+        'categories': [c.name for c in categories],
+        'is_bijective': all(c == OperatorCategory.BIJECTION for c in categories),
+        'is_invertible': all(op.is_invertible for op in ops),
+        'preserves_mass': all(op.preserves_mass for op in ops),
+        'has_surjection': any(c == OperatorCategory.SURJECTION for c in categories),
+        'has_injection': any(c == OperatorCategory.INJECTION for c in categories),
+        'symbolic': " ∘ ".join(op.to_symbolic() for op in reversed(ops)),
+    }
+
+
+def infer_result_category(ops: List[Operator]) -> OperatorCategory:
+    """Infer the category of a composition of operators."""
+    if not ops:
+        return OperatorCategory.IDENTITY
+    
+    categories = [op.category for op in ops]
+    
+    if all(c == OperatorCategory.IDENTITY for c in categories):
+        return OperatorCategory.IDENTITY
+    
+    if all(c in (OperatorCategory.BIJECTION, OperatorCategory.IDENTITY) for c in categories):
+        return OperatorCategory.BIJECTION
+    
+    if any(c == OperatorCategory.SURJECTION for c in categories):
+        return OperatorCategory.SURJECTION
+    
+    if any(c == OperatorCategory.INJECTION for c in categories):
+        return OperatorCategory.INJECTION
+    
+    if any(c == OperatorCategory.PROJECTION for c in categories):
+        return OperatorCategory.PROJECTION
+    
+    return OperatorCategory.BIJECTION

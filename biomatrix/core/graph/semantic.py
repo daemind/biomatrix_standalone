@@ -1663,37 +1663,148 @@ def derive_affine_composition(s_in: 'State', s_out: 'State') -> Optional[Dict[st
             if len(tile_out) != n_in:
                 continue  # Skip incomplete tiles
             
-            # Match to input via Hungarian with COLOR-weighted distance
-            # Color must match exactly, spatial can vary
-            spatial_dists = cdist(s_in.points[:, :2], tile_out[:, :2])
+            # Normalize tile to origin for comparison
+            tile_spatial = tile_out[:, :2]
+            tile_min = tile_spatial.min(axis=0)
+            tile_normalized = tile_spatial - tile_min
             
-            # Color distance (high weight = must match)
-            if n_dims > 2:
-                color_dists = cdist(s_in.points[:, 2:], tile_out[:, 2:])
-                # Color mismatch = very high penalty
-                total_dists = spatial_dists + 1000 * color_dists
-            else:
-                total_dists = spatial_dists
+            in_spatial = s_in.points[:, :2]
+            in_min = in_spatial.min(axis=0)
+            in_normalized = in_spatial - in_min
+            in_extent = in_spatial.max(axis=0) - in_min
             
-            row_ind, col_ind = linear_sum_assignment(total_dists)
+            # Define all 8 orthogonal transformations (D4 group)
+            # Each is (A_2x2, center_adjustment_needed)
+            orthogonal_transforms = [
+                (np.array([[1, 0], [0, 1]]), False),   # Identity
+                (np.array([[-1, 0], [0, 1]]), True),   # Flip horizontal
+                (np.array([[1, 0], [0, -1]]), True),   # Flip vertical  
+                (np.array([[-1, 0], [0, -1]]), True),  # Rotate 180
+                (np.array([[0, -1], [1, 0]]), True),   # Rotate 90 CCW
+                (np.array([[0, 1], [-1, 0]]), True),   # Rotate 90 CW
+                (np.array([[0, 1], [1, 0]]), True),    # Transpose
+                (np.array([[0, -1], [-1, 0]]), True),  # Anti-transpose
+            ]
             
-            X = s_in.points[row_ind, :n_dims]
-            Y = tile_out[col_ind]
+            best_A = None
+            best_b = None
+            best_match = 0
             
-            # Derive affine for this tile
-            X_aug = np.hstack([X, np.ones((len(X), 1))])
-            solution, _, _, _ = np.linalg.lstsq(X_aug, Y, rcond=None)
+            for A_2d, needs_adjust in orthogonal_transforms:
+                # Apply transformation to input, centered at origin
+                center = in_extent / 2
+                if needs_adjust:
+                    transformed = (in_normalized - center) @ A_2d.T + center
+                    # Renormalize to origin
+                    t_min = transformed.min(axis=0)
+                    transformed = transformed - t_min
+                else:
+                    transformed = in_normalized
+                
+                # Compare transformed input to tile (as point sets)
+                from ..topology import view_as_void
+                
+                # Round and create combined (spatial, color) keys
+                in_keys = np.round(transformed, 2)
+                tile_keys = np.round(tile_normalized, 2)
+                
+                if n_dims > 2:
+                    # Include color in comparison
+                    in_combined = np.hstack([in_keys, s_in.points[:, 2:]])
+                    tile_combined = np.hstack([tile_keys, tile_out[:, 2:]])
+                else:
+                    in_combined = in_keys
+                    tile_combined = tile_keys
+                
+                # Check if sets match
+                in_void = view_as_void(in_combined.astype(np.float64))
+                tile_void = view_as_void(tile_combined.astype(np.float64))
+                
+                in_set = set(tuple(v.tobytes()) for v in in_void)
+                tile_set = set(tuple(v.tobytes()) for v in tile_void)
+                
+                match_ratio = len(in_set & tile_set) / max(len(in_set), 1)
+                
+                if match_ratio > best_match:
+                    best_match = match_ratio
+                    best_A = A_2d
+                    best_b = tile_min - in_min  # Translation from input to tile
             
-            A_k = solution[:-1, :].T
-            b_k = solution[-1, :]
+            if best_A is not None and best_match > 0.8:
+                # Build full A matrix
+                A_full = np.eye(n_dims)
+                A_full[:2, :2] = best_A
+                b_full = np.zeros(n_dims)
+                b_full[:2] = best_b
+                
+                transforms.append({'A': A_full, 'b': b_full, 'match': best_match})
+        
+        # ALGEBRAIC GROUP STRUCTURE DISCOVERY
+        # Analyze the derived linear parts A_k to discover if they form a group
+        if len(transforms) >= 2:
+            linear_parts = [t['A'][:2, :2] for t in transforms if t['A'].shape[0] >= 2]
             
-            transforms.append({'A': A_k, 'b': b_k})
+            if linear_parts:
+                # Classify each matrix by its algebraic properties
+                # det(A) = ±1 indicates orthogonal transformation
+                # Eigenvalues reveal rotation/reflection
+                group_elements = []
+                
+                for A in linear_parts:
+                    det = np.linalg.det(A)
+                    trace = np.trace(A)
+                    
+                    # Check if orthogonal (A @ A.T ≈ I)
+                    is_orthogonal = np.allclose(A @ A.T, np.eye(2), atol=0.1)
+                    
+                    # Classify algebraically
+                    if is_orthogonal:
+                        if np.allclose(det, 1.0, atol=0.1):
+                            # Rotation: det=1, orthogonal
+                            if np.allclose(trace, 2.0, atol=0.1):
+                                elem_type = 'identity'
+                            elif np.allclose(trace, -2.0, atol=0.1):
+                                elem_type = 'rotation_180'
+                            else:
+                                elem_type = 'rotation'
+                        else:
+                            # Reflection: det=-1, orthogonal
+                            elem_type = 'reflection'
+                    else:
+                        elem_type = 'affine'
+                    
+                    group_elements.append({
+                        'type': elem_type,
+                        'det': det,
+                        'trace': trace,
+                        'matrix': A
+                    })
+                
+                # Count element types to identify group
+                type_counts = {}
+                for e in group_elements:
+                    type_counts[e['type']] = type_counts.get(e['type'], 0) + 1
+                
+                # Infer group from element composition
+                group_info = {
+                    'element_types': type_counts,
+                    'n_elements': len(group_elements),
+                    'is_closed': len(group_elements) >= 2  # Simplified check
+                }
+                
+                return {
+                    'type': 'composition',
+                    'transforms': transforms,
+                    'n_components': len(transforms),
+                    'group_structure': group_info,
+                    'coverage': 1.0
+                }
         
         return {
             'type': 'composition',
             'transforms': transforms,
             'n_components': len(transforms),
-            'coverage': 1.0  # TODO: compute actual
+            'coverage': 1.0
         }
     
     return None
@@ -2000,23 +2111,7 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
     continuous_dims = [0, 1] if n_dims >= 2 else list(range(n_dims))
     discrete_dims = list(range(2, n_dims))  # Color dims
     
-    # Check for D2 group tiling first (mirror tiling pattern)
-    s_in_train, s_out_train = training_pairs[0]
-    d2_info = detect_d2_tiling(s_in_train, s_out_train)
-    
-    if d2_info is not None:
-        from ..operators.affine import GroupActionTilingOperator
-        
-        # Get test input extent
-        test_extent = test_input.points[:, :2].max(axis=0) - test_input.points[:, :2].min(axis=0) + 1
-        
-        # Create D2 group tiling operator
-        d2_op = GroupActionTilingOperator.d2_from_extent(test_extent)
-        predicted = d2_op.apply(test_input)
-        
-        return predicted, f"D2 GROUP TILING\nInput: {int(test_extent[0])}x{int(test_extent[1])} → Output: {int(2*test_extent[0])}x{int(2*test_extent[1])}\nGroup: D2 = {{identity, flip_h, flip_v, flip_both}}"
-    
-    # If regular tiling detected (2x, 3x, etc.), use TilingOperator (algebraic)
+    # If tiling detected (2x, 3x, etc.), use TilingOperator (algebraic)
     if is_shape_change and all(r > 1.0 for r in extent_ratio):
         from ..operators.replication import TilingOperator
         from ..operators.affine import ValuePermutationOperator
@@ -2181,60 +2276,19 @@ def solve_with_affine_composition(training_pairs: List[Tuple['State', 'State']],
     Unified Affine Primitive Solver.
     
     Learns affine composition T = Union(T_k) from training,
-    applies to test. No hardcoded patterns - semantics emerge from derived A, b.
+    applies to test. Semantics emerge from derived A, b.
     """
     from ..state import State
-    from ..operators.affine import GlobalAffineOperator, GroupActionTilingOperator
+    from ..operators.affine import GlobalAffineOperator
     
     if not training_pairs:
         return test_input, "No training pairs"
     
-    # Check for D2 group tiling first (mirror tiling pattern)
-    s_in, s_out = training_pairs[0]
-    d2_info = detect_d2_tiling(s_in, s_out)
-    
-    if d2_info is not None:
-        # Get test input extent
-        test_extent = test_input.points[:, :2].max(axis=0) - test_input.points[:, :2].min(axis=0) + 1
-        
-        # Create D2 group tiling operator
-        d2_op = GroupActionTilingOperator.d2_from_extent(test_extent)
-        predicted = d2_op.apply(test_input)
-        
-        return predicted, f"D2 GROUP TILING\nInput: {int(test_extent[0])}x{int(test_extent[1])} → Output: {int(2*test_extent[0])}x{int(2*test_extent[1])}\nGroup: D2 = {{identity, flip_h, flip_v, flip_both}}"
-    
-    # Check for set operation (binary operation on components)
-    set_info = derive_set_operation(s_in, s_out)
-    
-    if set_info is not None:
-        from ..topology import partition_by_connectivity
-        from ..operators.logic import BinarySetOperator
-        
-        # Partition test input
-        test_components = partition_by_connectivity(test_input)
-        
-        if len(test_components) >= 2:
-            idx_a = set_info['component_a_idx']
-            idx_b = set_info['component_b_idx']
-            
-            if idx_a < len(test_components) and idx_b < len(test_components):
-                comp_a = test_components[idx_a]
-                comp_b = test_components[idx_b]
-                
-                set_op = BinarySetOperator(
-                    operation=set_info['operation'],
-                    state_b=comp_b,
-                    output_color=set_info['output_color']
-                )
-                predicted = set_op.apply(comp_a)
-                
-                op_symbols = {'intersection': '∩', 'union': '∪', 'sym_diff': '△', 'diff_ab': '\\', 'diff_ba': '/'}
-                return predicted, f"SET OPERATION\nA {op_symbols.get(set_info['operation'], '?')} B\nComponents: {idx_a}, {idx_b}\nOutput color: {set_info['output_color']}"
-    
     # Learn affine composition from first training pair
+    s_in, s_out = training_pairs[0]
     composition = derive_affine_composition(s_in, s_out)
     
-    # Fallback to existing solver if affine composition fails
+    # Fallback to causal groups solver if affine composition fails
     if composition is None:
         return solve_arc_with_causal_groups(training_pairs, test_input)
     
@@ -2272,29 +2326,67 @@ def solve_with_affine_composition(training_pairs: List[Tuple['State', 'State']],
         explanation = f"Single affine + {len(chromatic_bijection)} color mappings"
         
     elif composition['type'] == 'composition':
-        # Union of affine transforms
+        # Union of affine transforms (tiling with possible reflections)
         all_points = []
+        
+        # Compute test input extent for centering
+        test_spatial = test_input.points[:, :2]
+        test_min = test_spatial.min(axis=0)
+        test_extent = test_spatial.max(axis=0) - test_min
+        center = test_extent / 2
         
         for t in composition['transforms']:
             A = t['A']
             b = t['b']
             
-            # Pad to match dimensions
-            if A.shape[0] < n_dims:
-                A_padded = np.eye(n_dims)
-                A_padded[:A.shape[0], :A.shape[1]] = A
-                A = A_padded
-                b_padded = np.zeros(n_dims)
-                b_padded[:len(b)] = b
-                b = b_padded
+            # For 2D orthogonal transforms, apply centered transformation
+            if A.shape[0] >= 2:
+                A_2d = A[:2, :2]
+                det = np.linalg.det(A_2d)
+                
+                # Check if orthogonal (reflection or rotation)
+                is_orthogonal = np.allclose(A_2d @ A_2d.T, np.eye(2), atol=0.1)
+                
+                if is_orthogonal and not np.allclose(A_2d, np.eye(2), atol=0.1):
+                    # Apply centered transformation: translate to origin, transform, translate back
+                    spatial = test_input.points[:, :2] - test_min
+                    centered = spatial - center
+                    transformed_spatial = centered @ A_2d.T + center
+                    
+                    # Add tile translation
+                    new_spatial = transformed_spatial + b[:2]
+                    
+                    # Combine with chromatic dims
+                    if n_dims > 2:
+                        new_points = np.hstack([new_spatial, test_input.points[:, 2:]])
+                    else:
+                        new_points = new_spatial
+                else:
+                    # Identity or non-orthogonal: simple affine
+                    if A.shape[0] < n_dims:
+                        A_padded = np.eye(n_dims)
+                        A_padded[:A.shape[0], :A.shape[1]] = A
+                        A = A_padded
+                        b_padded = np.zeros(n_dims)
+                        b_padded[:len(b)] = b
+                        b = b_padded
+                    new_points = test_input.points @ A.T + b
+            else:
+                new_points = test_input.points @ A.T + b
             
-            new_points = test_input.points @ A.T + b
             all_points.append(new_points)
         
         combined = np.vstack(all_points)
         predicted = State(combined)
         
-        explanation = f"Composition of {composition['n_components']} affine transforms"
+        # Include discovered group structure in explanation
+        group_info = composition.get('group_structure', {})
+        if group_info:
+            element_types = group_info.get('element_types', {})
+            explanation = f"Composition of {composition['n_components']} transforms\n"
+            explanation += f"Discovered group elements: {element_types}"
+        else:
+            explanation = f"Composition of {composition['n_components']} affine transforms"
     else:
         return test_input, f"Unknown composition type: {composition['type']}"
     

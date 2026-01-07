@@ -970,6 +970,102 @@ def explain_semantic_resolution(s_in: 'State', s_out: 'State',
     return "\n".join(lines)
 
 
+def apply_semantic_rules(rules: List[SemanticRule], s_test: 'State',
+                         training_pairs: List[Tuple['State', 'State']] = None) -> 'State':
+    """
+    Apply derived semantic rules to a test input.
+    
+    This completes the ARC pipeline:
+    1. derive_semantic_rules(train_in, train_out) → rules
+    2. apply_semantic_rules(rules, test_in) → predicted_out
+    """
+    from ..topology import partition_by_connectivity
+    from ..state import State
+    
+    result_points = s_test.points.copy()
+    
+    for rule in rules:
+        if rule.action == "PERMUTE" and rule.source == "object.colors":
+            # Apply color permutation
+            if 'changes' in rule.params:
+                # Build color map from training examples
+                color_map = {}
+                for colors_in, colors_out in rule.params['changes']:
+                    for c_in, c_out in zip(colors_in, colors_out):
+                        color_map[float(c_in)] = float(c_out)
+                
+                # Apply to test
+                if s_test.n_dims >= 3:
+                    for i in range(len(result_points)):
+                        old_color = float(np.round(result_points[i, 2], 0))
+                        if old_color in color_map:
+                            result_points[i, 2] = color_map[old_color]
+                        else:
+                            # Color not in training - need to infer pattern
+                            # For now, keep original
+                            pass
+            
+            elif 'from' in rule.params and 'to' in rule.params:
+                # Uniform color mapping
+                color_map = dict(zip(rule.params['from'], rule.params['to']))
+                if s_test.n_dims >= 3:
+                    for i in range(len(result_points)):
+                        old_color = float(np.round(result_points[i, 2], 0))
+                        if old_color in color_map:
+                            result_points[i, 2] = color_map[old_color]
+        
+        elif rule.action == "TRANSLATE":
+            # Apply translation
+            if 'by' in rule.params:
+                translation = np.array(rule.params['by'])
+                if len(translation) <= s_test.n_dims:
+                    result_points[:, :len(translation)] += translation
+            
+            elif 'translations' in rule.params:
+                # Per-object translation - need to match objects
+                objs = partition_by_connectivity(s_test)
+                if len(objs) == len(rule.params['translations']):
+                    offset = 0
+                    for obj, trans in zip(objs, rule.params['translations']):
+                        trans_arr = np.array(trans)
+                        n_pts = obj.n_points
+                        # Find which points belong to this object
+                        # (simplified: assume order preserved)
+                        result_points[offset:offset+n_pts, :len(trans_arr)] += trans_arr
+                        offset += n_pts
+        
+        elif rule.action == "DUPLICATE":
+            # Duplicate all points
+            factor = rule.params.get('factor', 2)
+            duplicated = [result_points]
+            for i in range(1, factor):
+                duplicated.append(result_points.copy())
+            result_points = np.vstack(duplicated)
+    
+    return State(result_points)
+
+
+def solve_arc_semantically(training_pairs: List[Tuple['State', 'State']], 
+                           test_input: 'State',
+                           grid_shape: Tuple[int, int] = None) -> Tuple['State', str]:
+    """
+    Complete semantic ARC solver.
+    
+    Returns (predicted_output, explanation)
+    """
+    # Derive rules from first training pair (could use all)
+    train_in, train_out = training_pairs[0]
+    rules = derive_semantic_rules(train_in, train_out, grid_shape)
+    
+    # Apply rules to test
+    predicted = apply_semantic_rules(rules, test_input, training_pairs)
+    
+    # Generate explanation
+    explanation = explain_semantic_resolution(train_in, train_out, grid_shape)
+    
+    return predicted, explanation
+
+
 # Export
 __all__ = [
     'ConceptType', 'RelationType', 'Concept', 'Relation', 
@@ -977,5 +1073,6 @@ __all__ = [
     'InputPropertyMatcher', 'relativize_operator',
     'ObjectContext', 'compute_object_relations', 'build_scene_graph',
     'explain_scene', 'explain_transformation', 'explain_arc_solution',
-    'SemanticRule', 'derive_semantic_rules', 'explain_semantic_resolution'
+    'SemanticRule', 'derive_semantic_rules', 'explain_semantic_resolution',
+    'apply_semantic_rules', 'solve_arc_semantically'
 ]

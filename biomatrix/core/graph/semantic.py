@@ -24,6 +24,10 @@ class ConceptType(Enum):
     TOPOLOGICAL = auto()  # connectivity, boundary
     CARDINALITY = auto()  # count, mass
     RELATIONAL = auto()   # relative position, order
+    # ARC-specific contextual types
+    PATTERN = auto()      # line, rectangle, L-shape, etc.
+    CONTEXT = auto()      # boundary, interior, corner
+    OBJECT = auto()       # bounded entity in space
 
 
 class RelationType(Enum):
@@ -35,6 +39,16 @@ class RelationType(Enum):
     COPY = auto()          # Duplicate
     DEPENDS_ON = auto()    # Causal dependency
     RELATIVE_TO = auto()   # Referenced to another concept
+    # ARC-specific contextual relations
+    BOUNDED_BY = auto()    # Object is contained by grid/region
+    LEFT_OF = auto()       # Spatial relation
+    RIGHT_OF = auto()
+    ABOVE = auto()
+    BELOW = auto()
+    INSIDE = auto()        # Containment
+    ADJACENT_TO = auto()   # Touching
+    SAME_COLOR = auto()    # Chromatic equivalence
+    PATTERN_MATCH = auto() # Same pattern type
 
 
 @dataclass
@@ -324,9 +338,167 @@ def relativize_operator(operator: 'Operator', s_in: 'State') -> SemanticGraph:
     return graph
 
 
+class ObjectContext:
+    """
+    Contextual analysis of an object relative to its space.
+    
+    For ARC: an object is conditioned by its spatial context:
+    - Is it on the boundary? Interior? Corner?
+    - What pattern does it form? Line, rectangle, L-shape?
+    - Where is it relative to other objects?
+    """
+    
+    def __init__(self, state: 'State', grid_shape: Tuple[int, int] = None):
+        """Build contextual vocabulary for an object in its space."""
+        self.state = state
+        self.grid_shape = grid_shape or (int(state.bbox_max[0])+1, int(state.bbox_max[1])+1)
+        
+        # Compute contextual properties
+        self.props = {}
+        self._compute_boundary_context()
+        self._compute_pattern_type()
+        self._compute_symmetry()
+    
+    def _compute_boundary_context(self):
+        """Is the object touching grid boundaries?"""
+        if self.state.is_empty:
+            return
+            
+        bbox_min = self.state.bbox_min
+        bbox_max = self.state.bbox_max
+        h, w = self.grid_shape
+        
+        # Check boundary contact
+        self.props['touches_left'] = bbox_min[1] == 0 if len(bbox_min) > 1 else False
+        self.props['touches_right'] = bbox_max[1] >= w - 1 if len(bbox_max) > 1 else False
+        self.props['touches_top'] = bbox_min[0] == 0
+        self.props['touches_bottom'] = bbox_max[0] >= h - 1
+        
+        # Derive context type
+        n_touches = sum([
+            self.props['touches_left'], self.props['touches_right'],
+            self.props['touches_top'], self.props['touches_bottom']
+        ])
+        
+        self.props['is_corner'] = n_touches >= 2
+        self.props['is_edge'] = n_touches == 1
+        self.props['is_interior'] = n_touches == 0
+        self.props['is_spanning'] = n_touches >= 3  # spans most of grid
+    
+    def _compute_pattern_type(self):
+        """What geometric pattern does the object form?"""
+        if self.state.is_empty:
+            return
+        
+        pts = self.state.points[:, :2]  # spatial dims only
+        n = len(pts)
+        
+        # Bounding box properties
+        spread = self.state.spread[:2]
+        area = spread[0] * spread[1] if len(spread) >= 2 else spread[0]
+        
+        # Pattern detection via algebraic properties
+        self.props['is_point'] = n == 1
+        self.props['is_line_h'] = spread[0] == 0 and spread[1] > 0 if len(spread) >= 2 else False
+        self.props['is_line_v'] = spread[1] == 0 and spread[0] > 0 if len(spread) >= 2 else False
+        self.props['is_line'] = self.props.get('is_line_h', False) or self.props.get('is_line_v', False)
+        
+        # Rectangle test: n_points == area coverage
+        if len(spread) >= 2:
+            expected_rect_pts = (spread[0] + 1) * (spread[1] + 1)
+            self.props['is_filled_rect'] = n == expected_rect_pts
+            self.props['is_hollow_rect'] = n == 2 * (spread[0] + spread[1]) and n > 4
+        
+        self.props['is_square'] = len(spread) >= 2 and spread[0] == spread[1] and spread[0] > 0
+    
+    def _compute_symmetry(self):
+        """Check for symmetric patterns."""
+        if self.state.is_empty or self.state.n_points < 2:
+            return
+        
+        pts = self.state.points[:, :2]
+        centroid = pts.mean(axis=0)
+        
+        # Check horizontal symmetry: reflect across vertical center line
+        reflected_h = pts.copy()
+        reflected_h[:, 1] = 2 * centroid[1] - reflected_h[:, 1]
+        
+        # Check if reflected points match original (within tolerance)
+        from ..topology import view_as_void
+        orig_void = view_as_void(np.round(pts, 2).astype(float))
+        refl_void = view_as_void(np.round(reflected_h, 2).astype(float))
+        
+        self.props['symmetric_h'] = len(np.intersect1d(orig_void, refl_void)) == len(pts)
+        
+        # Vertical symmetry
+        reflected_v = pts.copy()
+        reflected_v[:, 0] = 2 * centroid[0] - reflected_v[:, 0]
+        refl_void_v = view_as_void(np.round(reflected_v, 2).astype(float))
+        self.props['symmetric_v'] = len(np.intersect1d(orig_void, refl_void_v)) == len(pts)
+    
+    def get_context_type(self) -> str:
+        """Return primary context type."""
+        if self.props.get('is_corner'):
+            return 'corner'
+        elif self.props.get('is_edge'):
+            return 'edge'
+        elif self.props.get('is_spanning'):
+            return 'spanning'
+        return 'interior'
+    
+    def get_pattern_type(self) -> str:
+        """Return primary pattern type."""
+        if self.props.get('is_point'):
+            return 'point'
+        elif self.props.get('is_line_h'):
+            return 'line_h'
+        elif self.props.get('is_line_v'):
+            return 'line_v'
+        elif self.props.get('is_filled_rect'):
+            return 'filled_rect'
+        elif self.props.get('is_hollow_rect'):
+            return 'hollow_rect'
+        elif self.props.get('is_square'):
+            return 'square'
+        return 'irregular'
+    
+    def to_concepts(self) -> List[Concept]:
+        """Convert context to semantic concepts."""
+        concepts = []
+        
+        concepts.append(Concept(
+            name='object.context',
+            ctype=ConceptType.CONTEXT,
+            value=self.get_context_type()
+        ))
+        
+        concepts.append(Concept(
+            name='object.pattern',
+            ctype=ConceptType.PATTERN,
+            value=self.get_pattern_type()
+        ))
+        
+        if self.props.get('symmetric_h'):
+            concepts.append(Concept(
+                name='object.symmetric_h',
+                ctype=ConceptType.TOPOLOGICAL,
+                value=True
+            ))
+        
+        if self.props.get('symmetric_v'):
+            concepts.append(Concept(
+                name='object.symmetric_v',
+                ctype=ConceptType.TOPOLOGICAL,
+                value=True
+            ))
+        
+        return concepts
+
+
 # Export
 __all__ = [
     'ConceptType', 'RelationType', 'Concept', 'Relation', 
     'SemanticGraph', 'extract_semantic_graph',
-    'InputPropertyMatcher', 'relativize_operator'
+    'InputPropertyMatcher', 'relativize_operator',
+    'ObjectContext'
 ]

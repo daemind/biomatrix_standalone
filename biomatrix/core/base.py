@@ -264,3 +264,94 @@ def infer_result_category(ops: List[Operator]) -> OperatorCategory:
         return OperatorCategory.PROJECTION
     
     return OperatorCategory.BIJECTION
+
+
+def extract_operator_type(op: Operator) -> str:
+    """
+    Extract structural type ignoring parameter values.
+    For ARC: detect that T(1,0) and T(5,3) are both 'T' (translation).
+    """
+    import re
+    symbolic = op.to_symbolic()
+    # Remove numeric parameters: T(1.00, 2.00) -> T(...)
+    pattern = re.sub(r'\([^)]*\)', '(...)', symbolic)
+    # Remove angle values: R(45.0°) -> R(...)
+    pattern = re.sub(r'\([0-9.]+°\)', '(...)', pattern)
+    return pattern
+
+
+def structural_match(op1: Operator, op2: Operator) -> bool:
+    """Check if two operators have same structural type (ignoring parameters)."""
+    return extract_operator_type(op1) == extract_operator_type(op2)
+
+
+def symbolic_match(op1: Operator, op2: Operator) -> bool:
+    """Check if two operators have equivalent symbolic structure."""
+    return op1.to_symbolic() == op2.to_symbolic()
+
+
+def extract_symbolic_pattern(ops: List[Operator]) -> Optional[str]:
+    """
+    Extract common symbolic pattern from multiple operators.
+    Returns the shared symbolic form if all operators match, None otherwise.
+    
+    For ARC: Check if solutions from training pairs share same structure.
+    """
+    if not ops:
+        return None
+    
+    symbols = [op.to_symbolic() for op in ops]
+    
+    if len(set(symbols)) == 1:
+        return symbols[0]
+    
+    return None
+
+
+def unify_solutions(derived_ops: List[Operator], pairs: List[Tuple['State', 'State']] = None) -> dict:
+    """
+    Analyze derived solutions across multiple pairs to find generalizable pattern.
+    
+    For ARC:
+    - pairs: List of (input, output) training pairs
+    - derived_ops: Operators derived for each pair
+    
+    Returns analysis dict with:
+    - 'unified': True if all solutions share same structure
+    - 'pattern': Common symbolic pattern if unified
+    - 'categories': List of operator categories
+    - 'details': Per-pair symbolic forms
+    """
+    if not derived_ops:
+        return {'unified': False, 'pattern': None, 'categories': [], 'details': []}
+    
+    symbols = [op.to_symbolic() for op in derived_ops]
+    structures = [extract_operator_type(op) for op in derived_ops]
+    categories = [op.category.name if hasattr(op, 'category') else 'UNKNOWN' for op in derived_ops]
+    
+    # Exact match (same parameters)
+    exact_unified = len(set(symbols)) == 1
+    # Structural match (same type, different parameters)
+    structural_unified = len(set(structures)) == 1
+    
+    pattern = symbols[0] if exact_unified else None
+    structural_pattern = structures[0] if structural_unified else None
+    
+    # Verification on pairs
+    verified = []
+    if pairs:
+        for op, (s_in, s_out) in zip(derived_ops, pairs):
+            result = op.apply(s_in)
+            verified.append(result == s_out)
+    
+    return {
+        'unified': exact_unified,
+        'structural_unified': structural_unified,
+        'pattern': pattern,
+        'structural_pattern': structural_pattern,
+        'categories': categories,
+        'details': symbols,
+        'structures': structures,
+        'verified': verified if pairs else None,
+        'generalizes': structural_unified and all(verified) if pairs else structural_unified,
+    }

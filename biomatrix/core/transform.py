@@ -266,6 +266,89 @@ class AffineTransform(Operator):
 
     def __repr__(self):
         return f"Affine(A={self.linear.shape}, b={self.translation.shape})"
+    
+    # === Algebraic Methods ===
+    
+    def inverse(self) -> 'AffineTransform':
+        """
+        Compute T⁻¹ such that T⁻¹ ∘ T = Identity.
+        
+        For T(x) = Ax + b, T⁻¹(x) = A⁻¹(x - b) = A⁻¹x - A⁻¹b
+        """
+        from .base import NotInvertibleError
+        
+        if not self.is_invertible:
+            raise NotInvertibleError(f"AffineTransform is singular (det={np.linalg.det(self.linear):.6f})")
+        
+        A_inv = np.linalg.inv(self.linear)
+        b_inv = -A_inv @ self.translation
+        return AffineTransform(linear=A_inv, translation=b_inv)
+    
+    def to_symbolic(self) -> str:
+        """Symbolic representation for human readability."""
+        decomp = self.decompose()
+        parts = []
+        
+        # Translation
+        if np.linalg.norm(self.translation) > 1e-6:
+            t_str = ", ".join(f"{v:.2f}" for v in self.translation)
+            parts.append(f"T({t_str})")
+        
+        # Rotation/Reflection
+        if decomp['planar_angle'] is not None:
+            angle_deg = np.degrees(decomp['planar_angle'])
+            if abs(angle_deg) > 0.1:
+                parts.append(f"R({angle_deg:.1f}°)")
+        
+        # Scale
+        scale_factors = decomp['scale_factors']
+        if not np.allclose(scale_factors, 1.0):
+            if np.allclose(scale_factors, scale_factors[0]):
+                parts.append(f"S({scale_factors[0]:.2f})")
+            else:
+                s_str = ", ".join(f"{v:.2f}" for v in scale_factors)
+                parts.append(f"S({s_str})")
+        
+        if decomp['is_reflection']:
+            parts.append("H")  # Householder/reflection
+        
+        if not parts:
+            return "Id"
+        
+        return " ∘ ".join(parts)
+    
+    # === Algebraic Properties ===
+    
+    @property
+    def is_invertible(self) -> bool:
+        """True if det(A) ≠ 0."""
+        return abs(np.linalg.det(self.linear)) > 1e-10
+    
+    @property
+    def is_linear(self) -> bool:
+        """True if translation is zero (pure linear map)."""
+        return np.allclose(self.translation, 0)
+    
+    @property
+    def preserves_mass(self) -> bool:
+        """Affine transforms are bijections, so they preserve mass."""
+        return self.is_invertible
+    
+    @property
+    def is_isometry(self) -> bool:
+        """True if A is orthogonal (preserves distances)."""
+        R = self.linear
+        return np.allclose(R @ R.T, np.eye(R.shape[0]), atol=1e-6)
+    
+    @property
+    def is_rotation(self) -> bool:
+        """True if A is a proper rotation (det = 1, orthogonal)."""
+        return self.is_isometry and np.linalg.det(self.linear) > 0
+    
+    @property
+    def is_reflection(self) -> bool:
+        """True if A is an improper rotation (det = -1, orthogonal)."""
+        return self.is_isometry and np.linalg.det(self.linear) < 0
 
 # Alias for compatibility if needed, but we prefer strict naming
 TransformationMatrix = AffineTransform

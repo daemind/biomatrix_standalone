@@ -194,10 +194,7 @@ class NormalizeOriginOperator(Operator):
 
 @dataclass
 class GlobalAffineOperator(Operator):
-    """
-    Global Affine Operator (Algebraic Monoïd).
-    Applies T(p) = Ap + b to ALL points.
-    """
+    """Global Affine Operator: T(p) = Ap + b applied to ALL points."""
     matrix: np.ndarray
     bias: np.ndarray
     
@@ -205,12 +202,51 @@ class GlobalAffineOperator(Operator):
         if state.is_empty:
             return state.copy()
         
-        # Dimension guard
         if self.matrix.shape[0] != state.n_dims:
             return state.copy()
         
         new_points = state.points @ self.matrix.T + self.bias
         return State(new_points)
+    
+    # === Algebraic Methods ===
+    
+    def inverse(self) -> 'GlobalAffineOperator':
+        """T⁻¹(x) = A⁻¹x - A⁻¹b."""
+        from ..base import NotInvertibleError
+        
+        if not self.is_invertible:
+            raise NotInvertibleError(f"GlobalAffineOperator is singular")
+        
+        M_inv = np.linalg.inv(self.matrix)
+        b_inv = -M_inv @ self.bias
+        return GlobalAffineOperator(matrix=M_inv, bias=b_inv)
+    
+    def to_symbolic(self) -> str:
+        """Symbolic representation."""
+        det = np.linalg.det(self.matrix)
+        b_norm = np.linalg.norm(self.bias)
+        
+        parts = []
+        if b_norm > 1e-6:
+            parts.append(f"T({b_norm:.2f})")
+        if not np.allclose(self.matrix, np.eye(self.matrix.shape[0])):
+            parts.append(f"A(det={det:.2f})")
+        
+        return " ∘ ".join(parts) if parts else "Id"
+    
+    # === Algebraic Properties ===
+    
+    @property
+    def is_invertible(self) -> bool:
+        return abs(np.linalg.det(self.matrix)) > 1e-10
+    
+    @property
+    def is_linear(self) -> bool:
+        return np.allclose(self.bias, 0)
+    
+    @property
+    def preserves_mass(self) -> bool:
+        return self.is_invertible
     
     def __repr__(self):
         return f"GlobalAffine(M={self.matrix.shape})"

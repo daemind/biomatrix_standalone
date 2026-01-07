@@ -77,6 +77,17 @@ class ConstantOperator(Operator):
         if self.points is None and other.points is None: return True
         if self.points is None or other.points is None: return False
         return np.array_equal(self.points, other.points)
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        n = len(self.points) if self.points is not None else 0
+        return f"K({n} pts)"
+    
+    @property
+    def category(self):
+        from ..base import OperatorCategory
+        return OperatorCategory.SURJECTION  # Ignores input
 
 
 
@@ -215,6 +226,24 @@ class BijectionOperator(Operator):
             return np.array_equal(a, b)
             
         return array_match(self.linear, other.linear) and array_match(self.translation, other.translation)
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        if self.translation is not None:
+            t_norm = np.linalg.norm(self.translation)
+            if t_norm > 1e-6:
+                return f"B(t={t_norm:.1f})"
+        return "B"
+    
+    @property
+    def category(self):
+        from ..base import OperatorCategory
+        return OperatorCategory.BIJECTION
+    
+    @property
+    def is_invertible(self) -> bool:
+        return True
 
 
 @dataclass

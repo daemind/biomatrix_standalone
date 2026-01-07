@@ -158,30 +158,35 @@ class SelectThenActOperator(Operator):
 
 @dataclass
 class SelectByValueOperator(Operator):
-    """
-    CAUSAL Selector: Select points where DIMENSION == VALUE.
-    
-    PURE N-DIM AGNOSTIC (AGENT.md):
-    - NO semantic types (no 'categorical', 'spatial', 'color')
-    - Dimension is an explicit index (0, 1, 2, ...)
-    - The calling code determines WHICH dimension via algebraic analysis
-    
-    Example: SelectByValueOperator(dim=2, value=3.0)
-    → "Select all points where dimension 2 equals 3.0"
-    """
-    dim: int = 0               # Dimension index (purely algebraic)
-    value: float = 0.0         # Value to match
+    """CAUSAL Selector: Select points where dim == value."""
+    dim: int = 0
+    value: float = 0.0
     tolerance: float = 1e-6
     
     def apply(self, state: State) -> State:
         if state.n_points == 0:
             return state.copy()
             
-        # Vectorized selection (no loops)
         vals = state.points[:, self.dim]
         mask = np.isclose(vals, self.value, atol=self.tolerance)
         
         return state.mask(mask)
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        return f"σ(d{self.dim}={self.value:.1f})"
+    
+    # === Algebraic Properties ===
+    
+    @property
+    def is_idempotent(self) -> bool:
+        """P² = P (applying twice gives same result)."""
+        return True
+    
+    @property
+    def preserves_mass(self) -> bool:
+        return False  # Reduces mass
 
     def __eq__(self, other):
         if not isinstance(other, SelectByValueOperator): return False

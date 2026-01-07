@@ -16,32 +16,38 @@ from ..state import State
 
 @dataclass
 class LinearSequenceOperator(Operator):
-    """
-    Chasles Iterative Sum: Sum_{k=0}^{n-1} τ(k*d)
-    
-    Arithmetic progression of translation operator.
-    Places copies of the pattern at regular intervals.
-    
-    Output = Union of τ(k*d)(A) for k in [0, n-1]
-    """
+    """Chasles Sum: Output = Union_{k=0}^{n-1} τ(k*d)(A)."""
     step: np.ndarray  # Translation step d
     count: int        # Number of repetitions n
     
     def apply(self, state: State) -> State:
-        # ALGEBRAIC: Broadcast translation using outer product (no loop)
         n_pts = state.n_points
-        k_vals = np.arange(self.count)[:, np.newaxis]  # (count, 1)
-        offsets = k_vals * self.step[np.newaxis, :]     # (count, step_dims)
+        k_vals = np.arange(self.count)[:, np.newaxis]
+        offsets = k_vals * self.step[np.newaxis, :]
         
-        # Broadcast: for each k, add offset to all points
         step_dims = len(self.step)
-        expanded = state.points[np.newaxis, :, :].repeat(self.count, axis=0)  # (count, n_pts, n_dims)
-        expanded[:, :, :step_dims] += offsets[:, np.newaxis, :]  # Add offsets to spatial dims
+        expanded = state.points[np.newaxis, :, :].repeat(self.count, axis=0)
+        expanded[:, :, :step_dims] += offsets[:, np.newaxis, :]
         
-        # Flatten to (count * n_pts, n_dims)
         new_points = expanded.reshape(-1, state.n_dims)
         
         return State(points=new_points)
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        step_str = ", ".join(f"{v:.1f}" for v in self.step)
+        return f"Σ_{self.count}τ({step_str})"
+    
+    # === Algebraic Properties ===
+    
+    @property
+    def is_invertible(self) -> bool:
+        return False  # Mass-increasing
+    
+    @property
+    def preserves_mass(self) -> bool:
+        return False  # Multiplies mass by count
 
 
 @dataclass
@@ -209,31 +215,37 @@ class ReplicationOperator(Operator):
 
 @dataclass
 class TilingOperator(Operator):
-    """
-    Algebraic Tiling: Repeated Translation.
-    
-    Output = Union_k (Input + t_k)
-    
-    Used for filling, pattern repetition, and generative tasks.
-    """
+    """Algebraic Tiling: Output = Union_k (Input + t_k)."""
     translations: np.ndarray  # (K, D) translation vectors
     
     def apply(self, state: State) -> State:
         if state.is_empty:
             return state.copy()
             
-        # ALGEBRAIC: Broadcasting (no loops)
-        X = state.points  # (N, D)
-        T = self.translations  # (K, D)
+        X = state.points
+        T = self.translations
         
-        # Broadcast: (N, 1, D) + (1, K, D) -> (N, K, D) -> (N*K, D)
         expanded = X[:, np.newaxis, :] + T[np.newaxis, :, :]
         result_pts = expanded.reshape(-1, state.n_dims)
-        
-        # Remove duplicates 
         unique_pts = np.unique(result_pts, axis=0)
         
         return State(unique_pts)
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        n_tiles = len(self.translations)
+        return f"Tile({n_tiles})"
+    
+    # === Algebraic Properties ===
+    
+    @property
+    def is_invertible(self) -> bool:
+        return False  # Mass-increasing, not bijective
+    
+    @property
+    def preserves_mass(self) -> bool:
+        return False  # Increases mass by factor K
     
     def __repr__(self):
         return f"Tiling(|T|={len(self.translations)})"

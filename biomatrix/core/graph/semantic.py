@@ -1324,6 +1324,62 @@ def solve_arc_with_global_mapping(training_pairs: List[Tuple['State', 'State']],
     return predicted, explanation
 
 
+def detect_symmetry(s_in: 'State', s_out: 'State', n_spatial: int = 2) -> Optional[Dict[str, Any]]:
+    """
+    Algebraic Symmetry Detection.
+    
+    Tests if s_out matches s_in reflected along any combination of spatial axes.
+    Reflection = multiplication by diagonal sign matrix: R = diag(signs)
+    
+    Mathematical: reflected = centroid + (points - centroid) @ diag(signs)
+    
+    Returns best matching reflection_signs or None if no match.
+    """
+    if s_in.n_points != s_out.n_points:
+        return None
+    
+    from ..topology import view_as_void
+    from itertools import product
+    
+    n_dims = s_in.n_dims
+    centroid = s_in.centroid
+    
+    # Test all 2^n_spatial sign combinations
+    all_sign_combos = list(product([1.0, -1.0], repeat=min(n_spatial, n_dims)))
+    
+    best_match = None
+    best_coverage = 0
+    
+    for signs_tuple in all_sign_combos:
+        # Build full signs array (spatial dims get sign, chromatic dims stay +1)
+        signs = np.ones(n_dims)
+        signs[:len(signs_tuple)] = np.array(signs_tuple)
+        
+        # Algebraic reflection via broadcasting
+        reflected = centroid + (s_in.points - centroid) * signs
+        
+        # Compare with s_out using set intersection
+        ref_void = view_as_void(np.round(reflected, 4).astype(np.float64))
+        out_void = view_as_void(np.round(s_out.points, 4).astype(np.float64))
+        
+        # Count matching points
+        coverage = np.sum(np.isin(ref_void, out_void)) / len(ref_void) if len(ref_void) > 0 else 0
+        
+        if coverage > best_coverage:
+            best_coverage = coverage
+            best_match = {
+                'signs': signs,
+                'coverage': coverage,
+                'is_identity': np.all(np.array(signs_tuple) == 1.0)
+            }
+    
+    # Only return if significant match and not identity
+    if best_match and best_coverage > 0.9 and not best_match['is_identity']:
+        return best_match
+    
+    return None
+
+
 def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[str, Any]:
     """
     Greedy detection of causal groups with GENERALIZED transformation:

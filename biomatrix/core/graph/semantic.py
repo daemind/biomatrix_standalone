@@ -495,10 +495,124 @@ class ObjectContext:
         return concepts
 
 
+def compute_object_relations(objects: List['State']) -> List[Relation]:
+    """
+    Compute spatial relations between multiple objects.
+    
+    For ARC: understanding how objects relate to each other
+    is key to generalization.
+    """
+    relations = []
+    
+    for i, obj_a in enumerate(objects):
+        for j, obj_b in enumerate(objects):
+            if i >= j:
+                continue
+            
+            # Get bboxes
+            a_min, a_max = obj_a.bbox_min[:2], obj_a.bbox_max[:2]
+            b_min, b_max = obj_b.bbox_min[:2], obj_b.bbox_max[:2]
+            a_cent = obj_a.centroid[:2]
+            b_cent = obj_b.centroid[:2]
+            
+            # Relative position (based on centroids)
+            if a_cent[1] < b_cent[1] - 1:  # A is left of B
+                relations.append(Relation(f"obj_{i}", f"obj_{j}", RelationType.LEFT_OF))
+            elif a_cent[1] > b_cent[1] + 1:  # A is right of B
+                relations.append(Relation(f"obj_{i}", f"obj_{j}", RelationType.RIGHT_OF))
+            
+            if a_cent[0] < b_cent[0] - 1:  # A is above B
+                relations.append(Relation(f"obj_{i}", f"obj_{j}", RelationType.ABOVE))
+            elif a_cent[0] > b_cent[0] + 1:  # A is below B
+                relations.append(Relation(f"obj_{i}", f"obj_{j}", RelationType.BELOW))
+            
+            # Containment: A inside B?
+            if (a_min[0] >= b_min[0] and a_max[0] <= b_max[0] and
+                a_min[1] >= b_min[1] and a_max[1] <= b_max[1]):
+                if obj_a.n_points < obj_b.n_points:
+                    relations.append(Relation(f"obj_{i}", f"obj_{j}", RelationType.INSIDE))
+            
+            # B inside A?
+            if (b_min[0] >= a_min[0] and b_max[0] <= a_max[0] and
+                b_min[1] >= a_min[1] and b_max[1] <= a_max[1]):
+                if obj_b.n_points < obj_a.n_points:
+                    relations.append(Relation(f"obj_{j}", f"obj_{i}", RelationType.INSIDE))
+            
+            # Adjacent: bboxes touch but don't overlap
+            h_gap = max(0, max(a_min[1] - b_max[1], b_min[1] - a_max[1]))
+            v_gap = max(0, max(a_min[0] - b_max[0], b_min[0] - a_max[0]))
+            
+            if (h_gap <= 1 and v_gap == 0) or (v_gap <= 1 and h_gap == 0):
+                relations.append(Relation(f"obj_{i}", f"obj_{j}", RelationType.ADJACENT_TO))
+            
+            # Same color?
+            if obj_a.n_dims >= 3 and obj_b.n_dims >= 3:
+                a_colors = set(np.round(obj_a.points[:, 2], 0))
+                b_colors = set(np.round(obj_b.points[:, 2], 0))
+                if a_colors == b_colors:
+                    relations.append(Relation(f"obj_{i}", f"obj_{j}", RelationType.SAME_COLOR))
+    
+    return relations
+
+
+def build_scene_graph(state: 'State', grid_shape: Tuple[int, int] = None) -> SemanticGraph:
+    """
+    Build complete semantic graph for a scene (state with multiple objects).
+    
+    This is the main entry point for ARC-style reasoning:
+    1. Partition into objects
+    2. Analyze each object's context
+    3. Compute inter-object relations
+    """
+    from ..topology import partition_by_connectivity
+    
+    graph = SemanticGraph()
+    
+    # Default grid shape from state bounds
+    if grid_shape is None:
+        grid_shape = (int(state.bbox_max[0]) + 1, int(state.bbox_max[1]) + 1)
+    
+    # Partition into objects
+    objects = partition_by_connectivity(state)
+    
+    # Add object concepts with context
+    for i, obj in enumerate(objects):
+        ctx = ObjectContext(obj, grid_shape)
+        
+        # Add object as concept
+        graph.add_concept(
+            f"obj_{i}",
+            ConceptType.OBJECT,
+            value={
+                'context': ctx.get_context_type(),
+                'pattern': ctx.get_pattern_type(),
+                'n_points': obj.n_points,
+            }
+        )
+        
+        # Add derived concepts
+        for concept in ctx.to_concepts():
+            concept.name = f"obj_{i}.{concept.name.split('.')[-1]}"
+            graph.concepts[concept.name] = concept
+    
+    # Compute and add inter-object relations
+    relations = compute_object_relations(objects)
+    graph.relations.extend(relations)
+    
+    # Add grid context
+    graph.add_concept(
+        "grid",
+        ConceptType.CONTEXT,
+        value={'shape': grid_shape}
+    )
+    
+    return graph
+
+
 # Export
 __all__ = [
     'ConceptType', 'RelationType', 'Concept', 'Relation', 
     'SemanticGraph', 'extract_semantic_graph',
     'InputPropertyMatcher', 'relativize_operator',
-    'ObjectContext'
+    'ObjectContext', 'compute_object_relations', 'build_scene_graph'
 ]

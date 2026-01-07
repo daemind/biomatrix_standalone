@@ -1380,6 +1380,111 @@ def detect_symmetry(s_in: 'State', s_out: 'State', n_spatial: int = 2) -> Option
     return None
 
 
+def derive_affine_composition(s_in: 'State', s_out: 'State') -> Optional[Dict[str, Any]]:
+    """
+    Unified Affine Primitive Decomposition.
+    
+    Derives T(p) = A @ p + b procedurally from data.
+    
+    For tiling (output > input): decomposes into Union of T_k
+    Each T_k = (A_k, b_k) derived via least squares from correspondences.
+    
+    The "semantics" EMERGE from A, b values - not hardcoded.
+    """
+    from scipy.spatial.distance import cdist
+    from scipy.optimize import linear_sum_assignment
+    
+    n_in = s_in.n_points
+    n_out = s_out.n_points
+    n_dims = min(s_in.n_dims, s_out.n_dims)
+    
+    if n_in == 0 or n_out == 0:
+        return None
+    
+    # Case 1: Same size → single affine T
+    if n_in == n_out:
+        # Point correspondence via Hungarian algorithm
+        dists = cdist(s_in.points[:, :n_dims], s_out.points[:, :n_dims])
+        row_ind, col_ind = linear_sum_assignment(dists)
+        
+        X = s_in.points[row_ind, :n_dims]
+        Y = s_out.points[col_ind, :n_dims]
+        
+        # Solve Y = X @ A.T + b via least squares
+        # Augment X with ones for bias: [X, 1] @ [A.T; b] = Y
+        X_aug = np.hstack([X, np.ones((len(X), 1))])
+        solution, residuals, rank, s = np.linalg.lstsq(X_aug, Y, rcond=None)
+        
+        A = solution[:-1, :].T  # (n_dims, n_dims)
+        b = solution[-1, :]     # (n_dims,)
+        
+        # Compute coverage
+        Y_pred = X @ A.T + b
+        errors = np.linalg.norm(Y_pred - Y, axis=1)
+        coverage = np.mean(errors < 0.5)
+        
+        return {
+            'type': 'single',
+            'A': A,
+            'b': b,
+            'coverage': coverage,
+            'n_components': 1
+        }
+    
+    # Case 2: Tiling (output is multiple of input) → Union of T_k
+    ratio = n_out / n_in
+    if ratio > 1 and ratio == int(ratio):
+        n_tiles = int(ratio)
+        
+        # Compute input extent for tile assignment
+        in_min = s_in.points.min(axis=0)
+        in_extent = s_in.points.max(axis=0) - in_min + 1
+        out_min = s_out.points.min(axis=0)
+        
+        # Assign each output point to a tile using modular arithmetic
+        # tile_idx = floor((out_pos - out_min) / in_extent)
+        out_relative = s_out.points - out_min
+        tile_coords = (out_relative[:, :2] / in_extent[:2]).astype(int)  # 2D tile grid
+        
+        # Create unique tile ID from coords
+        tile_ids = tile_coords[:, 0] * 100 + tile_coords[:, 1]  # Simple hash
+        unique_tiles = np.unique(tile_ids)
+        
+        transforms = []
+        
+        for tile_id in unique_tiles:
+            mask = tile_ids == tile_id
+            tile_out = s_out.points[mask, :n_dims]
+            
+            if len(tile_out) != n_in:
+                continue  # Skip incomplete tiles
+            
+            # Match to input via Hungarian
+            dists = cdist(s_in.points[:, :n_dims], tile_out)
+            row_ind, col_ind = linear_sum_assignment(dists)
+            
+            X = s_in.points[row_ind, :n_dims]
+            Y = tile_out[col_ind]
+            
+            # Derive affine for this tile
+            X_aug = np.hstack([X, np.ones((len(X), 1))])
+            solution, _, _, _ = np.linalg.lstsq(X_aug, Y, rcond=None)
+            
+            A_k = solution[:-1, :].T
+            b_k = solution[-1, :]
+            
+            transforms.append({'A': A_k, 'b': b_k})
+        
+        return {
+            'type': 'composition',
+            'transforms': transforms,
+            'n_components': len(transforms),
+            'coverage': 1.0  # TODO: compute actual
+        }
+    
+    return None
+
+
 def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[str, Any]:
     """
     Greedy detection of causal groups with GENERALIZED transformation:
@@ -1711,5 +1816,79 @@ __all__ = [
     'apply_semantic_rules', 'solve_arc_semantically',
     'unify_rules_across_pairs', 'explain_cross_pair_generalization',
     'learn_global_mapping', 'solve_arc_with_global_mapping',
-    'detect_causal_groups', 'solve_arc_with_causal_groups'
+    'detect_causal_groups', 'solve_arc_with_causal_groups',
+    'derive_affine_composition', 'solve_with_affine_composition'
 ]
+
+
+def solve_with_affine_composition(training_pairs: List[Tuple['State', 'State']],
+                                    test_input: 'State') -> Tuple['State', str]:
+    """
+    Unified Affine Primitive Solver.
+    
+    Learns affine composition T = Union(T_k) from training,
+    applies to test. No hardcoded patterns - semantics emerge from derived A, b.
+    """
+    from ..state import State
+    from ..operators.affine import GlobalAffineOperator
+    
+    if not training_pairs:
+        return test_input, "No training pairs"
+    
+    # Learn composition from first training pair
+    s_in, s_out = training_pairs[0]
+    composition = derive_affine_composition(s_in, s_out)
+    
+    if composition is None:
+        return test_input, "Could not derive affine composition"
+    
+    n_dims = test_input.n_dims
+    
+    if composition['type'] == 'single':
+        # Single affine transform
+        A = composition['A']
+        b = composition['b']
+        
+        # Pad A and b to match test dimensions
+        if A.shape[0] < n_dims:
+            A_padded = np.eye(n_dims)
+            A_padded[:A.shape[0], :A.shape[1]] = A
+            A = A_padded
+            b_padded = np.zeros(n_dims)
+            b_padded[:len(b)] = b
+            b = b_padded
+        
+        # Apply: output = input @ A.T + b
+        new_points = test_input.points @ A.T + b
+        predicted = State(new_points)
+        
+        explanation = f"Single affine: A shape={A.shape}, bias={b[:3]}..."
+        
+    elif composition['type'] == 'composition':
+        # Union of affine transforms
+        all_points = []
+        
+        for t in composition['transforms']:
+            A = t['A']
+            b = t['b']
+            
+            # Pad to match dimensions
+            if A.shape[0] < n_dims:
+                A_padded = np.eye(n_dims)
+                A_padded[:A.shape[0], :A.shape[1]] = A
+                A = A_padded
+                b_padded = np.zeros(n_dims)
+                b_padded[:len(b)] = b
+                b = b_padded
+            
+            new_points = test_input.points @ A.T + b
+            all_points.append(new_points)
+        
+        combined = np.vstack(all_points)
+        predicted = State(combined)
+        
+        explanation = f"Composition of {composition['n_components']} affine transforms"
+    else:
+        return test_input, f"Unknown composition type: {composition['type']}"
+    
+    return predicted, explanation

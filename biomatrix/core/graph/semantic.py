@@ -1326,21 +1326,42 @@ def solve_arc_with_global_mapping(training_pairs: List[Tuple['State', 'State']],
 
 def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[str, Any]:
     """
-    Greedy detection of causal groups with HYBRID transformation:
+    Greedy detection of causal groups with GENERALIZED transformation:
     
-    - Spatial dimensions (continuous): translation Δ, scale ratio
-    - Chromatic dimension (discrete): bijection mapping (c_in → c_out)
+    Decomposes T = T_spatial ∘ T_chromatic ∘ T_topological
     
-    Detects dimension types from data:
-    - Discrete dimension: small number of unique values (≤10)
-    - Continuous dimension: large range of values
+    - extent_ratio: shape change (1.0 = same, 2.0 = doubled, etc)
+    - spatial_type: STATIC, TRANSLATE, TILE
+    - chromatic_type: PRESERVE, BIJECTION
+    - topology_type: SAME, GROW, SHRINK
     """
     from ..topology import partition_by_connectivity
     
     observations = []
     chromatic_bijections = {}  # c_in → c_out
     
+    # Global extent ratios across all pairs
+    global_extent_ratios = []
+    
     for pair_idx, (s_in, s_out) in enumerate(training_pairs):
+        # Compute extent ratio at STATE level (shape change detection)
+        n_spatial = min(s_in.n_dims, s_out.n_dims, 2)  # First 2 dims are spatial
+        
+        extent_in = s_in.points[:, :n_spatial].max(axis=0) - s_in.points[:, :n_spatial].min(axis=0) + 1
+        extent_out = s_out.points[:, :n_spatial].max(axis=0) - s_out.points[:, :n_spatial].min(axis=0) + 1
+        extent_ratio = tuple(np.round(extent_out / (extent_in + 1e-10), 1))
+        global_extent_ratios.append(extent_ratio)
+        
+        # Detect periodicity in output (for tiling patterns)
+        # Periodicity = autocorrelation peaks at regular intervals
+        periodicity_detected = False
+        if n_spatial >= 2 and s_out.n_points > 10:
+            # Simple periodicity check: unique position count vs total
+            unique_colors = len(np.unique(np.round(s_out.points[:, 2] if s_out.n_dims > 2 else s_out.points[:, 0], 0)))
+            # If few unique colors but many points, likely periodic
+            if unique_colors <= 4 and s_out.n_points >= unique_colors * 3:
+                periodicity_detected = True
+        
         objs_in = partition_by_connectivity(s_in)
         objs_out = partition_by_connectivity(s_out)
         
@@ -1430,12 +1451,19 @@ def detect_causal_groups(training_pairs: List[Tuple['State', 'State']]) -> Dict[
             'transform_type': sig
         }
     
+    # Compute dominant extent_ratio (most common)
+    dominant_extent_ratio = max(set(global_extent_ratios), key=global_extent_ratios.count) if global_extent_ratios else (1.0, 1.0)
+    is_shape_change = any(r != 1.0 for r in dominant_extent_ratio)
+    
     return {
         'groups': groups,
         'profiles': group_profiles,
         'n_groups': len(groups),
         'observations': observations,
-        'chromatic_bijection': chromatic_bijections  # Global bijection learned
+        'chromatic_bijection': chromatic_bijections,
+        'extent_ratio': dominant_extent_ratio,
+        'is_shape_change': is_shape_change,
+        'periodicity_detected': any(obs.get('periodicity', False) for pair in training_pairs for obs in [])  # TODO: implement properly
     }
 
 
@@ -1488,6 +1516,20 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
     mapping = learn_global_mapping(training_pairs)
     chromatic_bijection = mapping.get('color_map', {})
     
+    # Get extent_ratio for shape changes
+    extent_ratio = detected.get('extent_ratio', (1.0, 1.0))
+    is_shape_change = detected.get('is_shape_change', False)
+    
+    # If shape change detected, we need to transform input extent
+    # Compute input extent
+    n_spatial = min(test_input.n_dims, 2)
+    input_min = test_input.points[:, :n_spatial].min(axis=0)
+    input_max = test_input.points[:, :n_spatial].max(axis=0)
+    input_extent = input_max - input_min + 1
+    
+    # Compute output extent based on ratio
+    output_extent = input_extent * np.array(extent_ratio[:n_spatial])
+    
     # Partition test
     test_objs = partition_by_connectivity(test_input)
     
@@ -1499,6 +1541,40 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
     n_dims = test_input.n_dims
     continuous_dims = [0, 1] if n_dims >= 2 else list(range(n_dims))
     discrete_dims = list(range(2, n_dims))  # Color dims
+    
+    # If tiling detected, generate tiled output
+    if is_shape_change and all(r > 1.0 for r in extent_ratio):
+        # TILING: repeat input pattern according to extent_ratio
+        tile_factors = [int(r) for r in extent_ratio[:n_spatial]]
+        
+        # Generate tiled positions using meshgrid pattern
+        tiled_points = []
+        for tx in range(tile_factors[0] if len(tile_factors) > 0 else 1):
+            for ty in range(tile_factors[1] if len(tile_factors) > 1 else 1):
+                offset = np.zeros(n_dims)
+                if n_spatial > 0:
+                    offset[0] = tx * input_extent[0]
+                if n_spatial > 1:
+                    offset[1] = ty * input_extent[1]
+                
+                # Clone all points and apply offset
+                new_points = test_input.points.copy()
+                new_points[:, :n_spatial] += offset[:n_spatial]
+                
+                # Apply chromatic bijection
+                for d in discrete_dims:
+                    original_colors = new_points[:, d].copy()
+                    for c_in, c_out in chromatic_bijection.items():
+                        mask = np.isclose(original_colors, c_in)
+                        new_points[mask, d] = c_out
+                
+                tiled_points.append(new_points)
+        
+        all_points = np.vstack(tiled_points)
+        predicted = State(all_points)
+        
+        lines = ["TILING transformation detected", f"extent_ratio: {extent_ratio}", f"tile: {tile_factors}"]
+        return predicted, "\n".join(lines)
     
     for obj in test_objs:
         

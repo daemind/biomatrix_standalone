@@ -1401,32 +1401,55 @@ def derive_affine_composition(s_in: 'State', s_out: 'State') -> Optional[Dict[st
     if n_in == 0 or n_out == 0:
         return None
     
-    # Case 1: Same size → single affine T
+    # Case 1: Same size → spatial affine + chromatic bijection
     if n_in == n_out:
-        # Point correspondence via Hungarian algorithm
-        dists = cdist(s_in.points[:, :n_dims], s_out.points[:, :n_dims])
-        row_ind, col_ind = linear_sum_assignment(dists)
+        n_spatial = min(2, n_dims)  # First 2 dims are spatial
         
-        X = s_in.points[row_ind, :n_dims]
-        Y = s_out.points[col_ind, :n_dims]
+        # Use COLOR-weighted Hungarian for robust correspondence
+        spatial_dists = cdist(s_in.points[:, :n_spatial], s_out.points[:, :n_spatial])
+        if n_dims > n_spatial:
+            color_dists = cdist(s_in.points[:, n_spatial:], s_out.points[:, n_spatial:])
+            total_dists = spatial_dists + 1000 * color_dists
+        else:
+            total_dists = spatial_dists
         
-        # Solve Y = X @ A.T + b via least squares
-        # Augment X with ones for bias: [X, 1] @ [A.T; b] = Y
-        X_aug = np.hstack([X, np.ones((len(X), 1))])
-        solution, residuals, rank, s = np.linalg.lstsq(X_aug, Y, rcond=None)
+        row_ind, col_ind = linear_sum_assignment(total_dists)
         
-        A = solution[:-1, :].T  # (n_dims, n_dims)
-        b = solution[-1, :]     # (n_dims,)
+        # Derive SPATIAL affine only (dims 0-1)
+        X_spatial = s_in.points[row_ind, :n_spatial]
+        Y_spatial = s_out.points[col_ind, :n_spatial]
+        
+        X_aug = np.hstack([X_spatial, np.ones((len(X_spatial), 1))])
+        solution, _, _, _ = np.linalg.lstsq(X_aug, Y_spatial, rcond=None)
+        
+        A_spatial = solution[:-1, :].T  # (n_spatial, n_spatial)
+        b_spatial = solution[-1, :]      # (n_spatial,)
+        
+        # Derive CHROMATIC bijection (dim 2+)
+        chromatic_bijection = {}
+        if n_dims > n_spatial:
+            for i, j in zip(row_ind, col_ind):
+                c_in = tuple(np.round(s_in.points[i, n_spatial:], 0).tolist())
+                c_out = tuple(np.round(s_out.points[j, n_spatial:], 0).tolist())
+                if c_in not in chromatic_bijection:
+                    chromatic_bijection[c_in] = c_out
+        
+        # Build full A matrix with identity for chromatic dims
+        A = np.eye(n_dims)
+        A[:n_spatial, :n_spatial] = A_spatial
+        b = np.zeros(n_dims)
+        b[:n_spatial] = b_spatial
         
         # Compute coverage
-        Y_pred = X @ A.T + b
-        errors = np.linalg.norm(Y_pred - Y, axis=1)
+        Y_pred_spatial = X_spatial @ A_spatial.T + b_spatial
+        errors = np.linalg.norm(Y_pred_spatial - Y_spatial, axis=1)
         coverage = np.mean(errors < 0.5)
         
         return {
             'type': 'single',
             'A': A,
             'b': b,
+            'chromatic_bijection': chromatic_bijection,
             'coverage': coverage,
             'n_components': 1
         }
@@ -1855,9 +1878,10 @@ def solve_with_affine_composition(training_pairs: List[Tuple['State', 'State']],
     n_dims = test_input.n_dims
     
     if composition['type'] == 'single':
-        # Single affine transform
+        # Single affine transform + chromatic bijection
         A = composition['A']
         b = composition['b']
+        chromatic_bijection = composition.get('chromatic_bijection', {})
         
         # Pad A and b to match test dimensions
         if A.shape[0] < n_dims:
@@ -1868,11 +1892,21 @@ def solve_with_affine_composition(training_pairs: List[Tuple['State', 'State']],
             b_padded[:len(b)] = b
             b = b_padded
         
-        # Apply: output = input @ A.T + b
+        # Apply spatial affine: output = input @ A.T + b
         new_points = test_input.points @ A.T + b
+        
+        # Apply chromatic bijection on dims 2+
+        if chromatic_bijection:
+            n_spatial = 2
+            for i in range(len(new_points)):
+                c_key = tuple(np.round(test_input.points[i, n_spatial:], 0).tolist())
+                if c_key in chromatic_bijection:
+                    c_new = chromatic_bijection[c_key]
+                    new_points[i, n_spatial:] = c_new
+        
         predicted = State(new_points)
         
-        explanation = f"Single affine: A shape={A.shape}, bias={b[:3]}..."
+        explanation = f"Single affine + {len(chromatic_bijection)} color mappings"
         
     elif composition['type'] == 'composition':
         # Union of affine transforms

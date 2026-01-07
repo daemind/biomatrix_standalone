@@ -233,6 +233,104 @@ class DifferenceOperator(LogicOperator):
 
 
 @dataclass
+class SymmetricDifferenceOperator(LogicOperator):
+    """
+    Symmetric Difference (XOR) of operators.
+    
+    (Op1 △ Op2)(S) = (Op1(S) \ Op2(S)) ∪ (Op2(S) \ Op1(S))
+    """
+    def apply(self, state: State) -> State:
+        if len(self.operands) < 2:
+            return state.copy()
+        
+        results = [op.apply(state) for op in self.operands]
+        
+        def sym_diff(s1: State, s2: State) -> State:
+            v1 = view_as_void(np.ascontiguousarray(s1.points))
+            v2 = view_as_void(np.ascontiguousarray(s2.points))
+            mask1 = ~np.isin(v1, v2).flatten()
+            mask2 = ~np.isin(v2, v1).flatten()
+            pts_list = []
+            if np.any(mask1):
+                pts_list.append(s1.points[mask1])
+            if np.any(mask2):
+                pts_list.append(s2.points[mask2])
+            pts = np.vstack(pts_list) if pts_list else np.empty((0, s1.n_dims))
+            return State(pts) if len(pts) > 0 else State(np.empty((0, s1.n_dims)))
+        
+        return reduce(sym_diff, results) if results else state.copy()
+    
+    def to_symbolic(self) -> str:
+        parts = [op.to_symbolic() if hasattr(op, 'to_symbolic') else type(op).__name__ for op in self.operands]
+        return "(" + " △ ".join(parts) + ")"
+
+
+@dataclass
+class BinarySetOperator(Operator):
+    """
+    Generic Binary Set Operator on two States.
+    
+    T(A, B) = op(A, B) where op ∈ {∩, ∪, △, A\\B, B\\A}
+    
+    ALGEBRAIC: Pure set operations via void view.
+    This is a composable primitive.
+    """
+    operation: str  # 'intersection', 'union', 'sym_diff', 'diff_ab', 'diff_ba'
+    state_b: State = None
+    output_color: int = 0
+    
+    def apply(self, state_a: State) -> State:
+        if state_a.is_empty or self.state_b is None or self.state_b.is_empty:
+            return state_a.copy()
+        
+        n_spatial = min(2, state_a.n_dims)
+        a_spatial = np.round(state_a.points[:, :n_spatial], 4)
+        b_spatial = np.round(self.state_b.points[:, :n_spatial], 4)
+        
+        va = view_as_void(a_spatial.astype(np.float64))
+        vb = view_as_void(b_spatial.astype(np.float64))
+        
+        in_a_only = ~np.isin(va, vb).flatten()
+        in_b_only = ~np.isin(vb, va).flatten()
+        in_both = np.isin(va, vb).flatten()
+        
+        # Dispatch algebraically
+        if self.operation == 'intersection':
+            result_pts = state_a.points[in_both]
+        elif self.operation == 'union':
+            pts_list = [state_a.points]
+            if np.any(in_b_only):
+                pts_list.append(self.state_b.points[in_b_only])
+            result_pts = np.vstack(pts_list)
+        elif self.operation == 'sym_diff':
+            pts_list = []
+            if np.any(in_a_only):
+                pts_list.append(state_a.points[in_a_only])
+            if np.any(in_b_only):
+                pts_list.append(self.state_b.points[in_b_only])
+            result_pts = np.vstack(pts_list) if pts_list else np.empty((0, state_a.n_dims))
+        elif self.operation == 'diff_ab':
+            result_pts = state_a.points[in_a_only]
+        elif self.operation == 'diff_ba':
+            result_pts = self.state_b.points[in_b_only]
+        else:
+            result_pts = state_a.points
+        
+        if len(result_pts) == 0:
+            return State(np.empty((0, state_a.n_dims)))
+        
+        if self.output_color > 0 and result_pts.shape[1] > 2:
+            result_pts = result_pts.copy()
+            result_pts[:, 2] = self.output_color
+        
+        return State(result_pts)
+    
+    def to_symbolic(self) -> str:
+        symbols = {'intersection': '∩', 'union': '∪', 'sym_diff': '△', 'diff_ab': '\\', 'diff_ba': '/'}
+        return f"(A {symbols.get(self.operation, '?')} B)"
+
+
+@dataclass
 class PartitionOperator(Operator):
     """
     General Partition Operator: T(S) = ⊔ T_i(S_i)

@@ -1465,6 +1465,102 @@ def detect_d2_tiling(s_in: 'State', s_out: 'State') -> Optional[Dict[str, Any]]:
     return None
 
 
+def derive_set_operation(s_in: 'State', s_out: 'State') -> Optional[Dict[str, Any]]:
+    """
+    Derive which binary set operation transforms input components to output.
+    
+    ALGEBRAIC: Tests all operations {∩, ∪, △, \\} on pairs of components.
+    Tries multiple partitioning strategies: connectivity, color groups.
+    Returns the operation and components if a match is found.
+    
+    This is a generic derivation, not hardcoded to any specific pattern.
+    """
+    from ..topology import partition_by_connectivity, partition_by_value, view_as_void
+    from ..state import State
+    
+    if s_in.n_dims < 3 or s_out.n_dims < 3:
+        return None
+    
+    def test_partition(components):
+        """Test all pairs of components with all set operations."""
+        if len(components) < 2:
+            return None
+        
+        out_spatial = np.round(s_out.points[:, :2], 4)
+        out_void = view_as_void(out_spatial.astype(np.float64))
+        
+        for i, comp_a in enumerate(components):
+            for j, comp_b in enumerate(components):
+                if i >= j:
+                    continue
+                
+                a_spatial = np.round(comp_a.points[:, :2], 4)
+                b_spatial = np.round(comp_b.points[:, :2], 4)
+                va = view_as_void(a_spatial.astype(np.float64))
+                vb = view_as_void(b_spatial.astype(np.float64))
+                
+                in_a_only = ~np.isin(va, vb).flatten()
+                in_b_only = ~np.isin(vb, va).flatten()
+                in_both = np.isin(va, vb).flatten()
+                
+                results = {
+                    'intersection': a_spatial[in_both] if np.any(in_both) else np.empty((0, 2)),
+                    'diff_ab': a_spatial[in_a_only] if np.any(in_a_only) else np.empty((0, 2)),
+                    'diff_ba': b_spatial[in_b_only] if np.any(in_b_only) else np.empty((0, 2)),
+                }
+                
+                sd_list = []
+                if np.any(in_a_only):
+                    sd_list.append(a_spatial[in_a_only])
+                if np.any(in_b_only):
+                    sd_list.append(b_spatial[in_b_only])
+                results['sym_diff'] = np.vstack(sd_list) if sd_list else np.empty((0, 2))
+                
+                for op_name, result in results.items():
+                    if len(result) == 0 or len(result) != len(out_void):
+                        continue
+                    
+                    result_void = view_as_void(result.astype(np.float64))
+                    if np.array_equal(np.sort(result_void), np.sort(out_void)):
+                        out_colors = s_out.points[:, 2]
+                        out_color = int(np.round(np.median(out_colors[out_colors > 0]))) if np.any(out_colors > 0) else 0
+                        
+                        return {
+                            'type': 'set_operation',
+                            'operation': op_name,
+                            'component_a_idx': i,
+                            'component_b_idx': j,
+                            'output_color': out_color,
+                            'coverage': 1.0
+                        }
+        return None
+    
+    # Strategy 1: Partition by connectivity
+    components = partition_by_connectivity(s_in)
+    result = test_partition(components)
+    if result:
+        result['partition_strategy'] = 'connectivity'
+        return result
+    
+    # Strategy 2: Partition by color (non-background color groups)
+    # Group points by color, ignoring background (0)
+    colors = s_in.points[:, 2]
+    unique_colors = np.unique(colors)
+    non_bg_colors = unique_colors[unique_colors > 0]
+    
+    if len(non_bg_colors) >= 2:
+        color_groups = []
+        for c in non_bg_colors:
+            mask = colors == c
+            if np.any(mask):
+                color_groups.append(State(s_in.points[mask]))
+        
+        result = test_partition(color_groups)
+        if result:
+            result['partition_strategy'] = 'color'
+            return result
+    
+    return None
 def derive_affine_composition(s_in: 'State', s_out: 'State') -> Optional[Dict[str, Any]]:
     """
     Unified Affine Primitive Decomposition.
@@ -2106,6 +2202,34 @@ def solve_with_affine_composition(training_pairs: List[Tuple['State', 'State']],
         predicted = d2_op.apply(test_input)
         
         return predicted, f"D2 GROUP TILING\nInput: {int(test_extent[0])}x{int(test_extent[1])} → Output: {int(2*test_extent[0])}x{int(2*test_extent[1])}\nGroup: D2 = {{identity, flip_h, flip_v, flip_both}}"
+    
+    # Check for set operation (binary operation on components)
+    set_info = derive_set_operation(s_in, s_out)
+    
+    if set_info is not None:
+        from ..topology import partition_by_connectivity
+        from ..operators.logic import BinarySetOperator
+        
+        # Partition test input
+        test_components = partition_by_connectivity(test_input)
+        
+        if len(test_components) >= 2:
+            idx_a = set_info['component_a_idx']
+            idx_b = set_info['component_b_idx']
+            
+            if idx_a < len(test_components) and idx_b < len(test_components):
+                comp_a = test_components[idx_a]
+                comp_b = test_components[idx_b]
+                
+                set_op = BinarySetOperator(
+                    operation=set_info['operation'],
+                    state_b=comp_b,
+                    output_color=set_info['output_color']
+                )
+                predicted = set_op.apply(comp_a)
+                
+                op_symbols = {'intersection': '∩', 'union': '∪', 'sym_diff': '△', 'diff_ab': '\\', 'diff_ba': '/'}
+                return predicted, f"SET OPERATION\nA {op_symbols.get(set_info['operation'], '?')} B\nComponents: {idx_a}, {idx_b}\nOutput color: {set_info['output_color']}"
     
     # Learn affine composition from first training pair
     composition = derive_affine_composition(s_in, s_out)

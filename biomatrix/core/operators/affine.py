@@ -347,6 +347,84 @@ class AffineTiling(Operator):
 
 
 @dataclass
+class GroupActionTilingOperator(Operator):
+    """
+    Group Action Tiling: T = ⋃_{g ∈ G} translate(g(input), offset_g)
+    
+    Applies a group of linear transformations (e.g., D2 = {Id, flip_h, flip_v, flip_both})
+    with corresponding translation offsets.
+    
+    ALGEBRAIC: Pure matrix operations, generalizes to any finite group.
+    """
+    group_matrices: List[np.ndarray]  # Each matrix is a linear transformation
+    translation_offsets: List[np.ndarray]  # Offset for each group element
+    
+    def apply(self, state: State) -> State:
+        if state.is_empty:
+            return state.copy()
+        
+        result_pts = []
+        pts = state.points
+        n_dims = pts.shape[1]
+        
+        # Apply each group element: g(input) + offset
+        for matrix, offset in zip(self.group_matrices, self.translation_offsets):
+            # Pad matrix/offset to n_dims if needed
+            if matrix.shape[0] < n_dims:
+                full_matrix = np.eye(n_dims)
+                full_matrix[:matrix.shape[0], :matrix.shape[1]] = matrix
+                matrix = full_matrix
+            if len(offset) < n_dims:
+                full_offset = np.zeros(n_dims)
+                full_offset[:len(offset)] = offset
+                offset = full_offset
+            
+            # Apply: g(input) + offset
+            transformed = pts @ matrix.T + offset
+            result_pts.append(transformed)
+        
+        return State(np.vstack(result_pts))
+    
+    @classmethod
+    def d2_from_extent(cls, extent: np.ndarray) -> 'GroupActionTilingOperator':
+        """
+        Create D2 (dihedral) group tiling from input extent.
+        
+        D2 = {identity, flip_h, flip_v, flip_both}
+        Output is 2x2 tiling with mirror symmetry.
+        """
+        h, w = extent[0], extent[1]
+        
+        # D2 group elements as 2x2 matrices
+        identity = np.eye(2)
+        flip_h = np.array([[1, 0], [0, -1]])  # Horizontal flip (negate y)
+        flip_v = np.array([[-1, 0], [0, 1]])  # Vertical flip (negate x)
+        flip_both = np.array([[-1, 0], [0, -1]])  # Both flips
+        
+        # Offsets to position each quadrant
+        # Bottom-right: identity at (h, w)
+        # Bottom-left: flip_h at (h, w-1) adjusted for flip
+        # Top-right: flip_v at (h-1, w) adjusted for flip
+        # Top-left: flip_both at (h-1, w-1) adjusted for flip
+        offset_br = np.array([h, w])
+        offset_bl = np.array([h, w - 1])  # Adjusted for horizontal flip
+        offset_tr = np.array([h - 1, w])  # Adjusted for vertical flip
+        offset_tl = np.array([h - 1, w - 1])  # Adjusted for both flips
+        
+        return cls(
+            group_matrices=[flip_both, flip_v, flip_h, identity],
+            translation_offsets=[offset_tl, offset_tr, offset_bl, offset_br]
+        )
+    
+    def to_symbolic(self) -> str:
+        n = len(self.group_matrices)
+        return f"GroupTile({n})"
+    
+    def __repr__(self):
+        return f"GroupActionTiling(|G|={len(self.group_matrices)})"
+
+
+@dataclass
 class KernelAffineOperator(Operator):
     """Applies Affine Transformation in a Kernel-Lifted Feature Space."""
     kernel_type: str

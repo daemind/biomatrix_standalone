@@ -1380,6 +1380,91 @@ def detect_symmetry(s_in: 'State', s_out: 'State', n_spatial: int = 2) -> Option
     return None
 
 
+def detect_d2_tiling(s_in: 'State', s_out: 'State') -> Optional[Dict[str, Any]]:
+    """
+    Detect if output is input tiled with D2 (dihedral) group action.
+    
+    D2 = {identity, flip_h, flip_v, flip_both}
+    
+    ALGEBRAIC: Checks if output is 2x extent of input AND each quadrant
+    matches a D2 transformation of the input.
+    
+    Returns derived transformation parameters or None.
+    """
+    from ..topology import view_as_void
+    
+    if s_in.n_dims < 3 or s_out.n_dims < 3:
+        return None
+    
+    # Get extents in first 2 spatial dims
+    in_extent = s_in.points[:, :2].max(axis=0) - s_in.points[:, :2].min(axis=0) + 1
+    out_extent = s_out.points[:, :2].max(axis=0) - s_out.points[:, :2].min(axis=0) + 1
+    
+    # Check if output is exactly 2x input in both dims
+    ratio = out_extent / in_extent
+    if not (np.allclose(ratio[0], 2.0, atol=0.1) and np.allclose(ratio[1], 2.0, atol=0.1)):
+        return None
+    
+    h, w = int(in_extent[0]), int(in_extent[1])
+    
+    # Normalize input to origin
+    in_min = s_in.points[:, :2].min(axis=0)
+    in_pts_norm = s_in.points.copy()
+    in_pts_norm[:, :2] -= in_min
+    
+    # Create grid representation for comparison
+    in_grid = np.full((h, w), -1, dtype=int)
+    for p in in_pts_norm:
+        r, c = int(p[0]), int(p[1])
+        if 0 <= r < h and 0 <= c < w:
+            in_grid[r, c] = int(p[2])
+    
+    # Normalize output to origin
+    out_min = s_out.points[:, :2].min(axis=0)
+    out_pts_norm = s_out.points.copy()
+    out_pts_norm[:, :2] -= out_min
+    
+    out_grid = np.full((2*h, 2*w), -1, dtype=int)
+    for p in out_pts_norm:
+        r, c = int(p[0]), int(p[1])
+        if 0 <= r < 2*h and 0 <= c < 2*w:
+            out_grid[r, c] = int(p[2])
+    
+    # D2 group elements
+    identity = in_grid
+    flip_h = np.fliplr(in_grid)
+    flip_v = np.flipud(in_grid)
+    flip_both = np.flipud(np.fliplr(in_grid))
+    
+    # Check each quadrant
+    quadrants = {
+        'top_left': out_grid[:h, :w],
+        'top_right': out_grid[:h, w:],
+        'bottom_left': out_grid[h:, :w],
+        'bottom_right': out_grid[h:, w:]
+    }
+    
+    # Expected pattern: one of each D2 element
+    expected = [
+        ('top_left', flip_both),
+        ('top_right', flip_v),
+        ('bottom_left', flip_h),
+        ('bottom_right', identity)
+    ]
+    
+    matches = sum(np.array_equal(quadrants[name], grid) for name, grid in expected)
+    
+    if matches == 4:
+        return {
+            'type': 'd2_tiling',
+            'input_extent': np.array([h, w]),
+            'group': 'D2',
+            'coverage': 1.0
+        }
+    
+    return None
+
+
 def derive_affine_composition(s_in: 'State', s_out: 'State') -> Optional[Dict[str, Any]]:
     """
     Unified Affine Primitive Decomposition.
@@ -1819,7 +1904,23 @@ def solve_arc_with_causal_groups(training_pairs: List[Tuple['State', 'State']],
     continuous_dims = [0, 1] if n_dims >= 2 else list(range(n_dims))
     discrete_dims = list(range(2, n_dims))  # Color dims
     
-    # If tiling detected, use TilingOperator (algebraic)
+    # Check for D2 group tiling first (mirror tiling pattern)
+    s_in_train, s_out_train = training_pairs[0]
+    d2_info = detect_d2_tiling(s_in_train, s_out_train)
+    
+    if d2_info is not None:
+        from ..operators.affine import GroupActionTilingOperator
+        
+        # Get test input extent
+        test_extent = test_input.points[:, :2].max(axis=0) - test_input.points[:, :2].min(axis=0) + 1
+        
+        # Create D2 group tiling operator
+        d2_op = GroupActionTilingOperator.d2_from_extent(test_extent)
+        predicted = d2_op.apply(test_input)
+        
+        return predicted, f"D2 GROUP TILING\nInput: {int(test_extent[0])}x{int(test_extent[1])} → Output: {int(2*test_extent[0])}x{int(2*test_extent[1])}\nGroup: D2 = {{identity, flip_h, flip_v, flip_both}}"
+    
+    # If regular tiling detected (2x, 3x, etc.), use TilingOperator (algebraic)
     if is_shape_change and all(r > 1.0 for r in extent_ratio):
         from ..operators.replication import TilingOperator
         from ..operators.affine import ValuePermutationOperator
@@ -1987,13 +2088,26 @@ def solve_with_affine_composition(training_pairs: List[Tuple['State', 'State']],
     applies to test. No hardcoded patterns - semantics emerge from derived A, b.
     """
     from ..state import State
-    from ..operators.affine import GlobalAffineOperator
+    from ..operators.affine import GlobalAffineOperator, GroupActionTilingOperator
     
     if not training_pairs:
         return test_input, "No training pairs"
     
-    # Learn composition from first training pair
+    # Check for D2 group tiling first (mirror tiling pattern)
     s_in, s_out = training_pairs[0]
+    d2_info = detect_d2_tiling(s_in, s_out)
+    
+    if d2_info is not None:
+        # Get test input extent
+        test_extent = test_input.points[:, :2].max(axis=0) - test_input.points[:, :2].min(axis=0) + 1
+        
+        # Create D2 group tiling operator
+        d2_op = GroupActionTilingOperator.d2_from_extent(test_extent)
+        predicted = d2_op.apply(test_input)
+        
+        return predicted, f"D2 GROUP TILING\nInput: {int(test_extent[0])}x{int(test_extent[1])} → Output: {int(2*test_extent[0])}x{int(2*test_extent[1])}\nGroup: D2 = {{identity, flip_h, flip_v, flip_both}}"
+    
+    # Learn affine composition from first training pair
     composition = derive_affine_composition(s_in, s_out)
     
     # Fallback to existing solver if affine composition fails

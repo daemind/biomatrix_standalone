@@ -110,6 +110,21 @@ class KroneckerOperator(Operator):
         result_pts = expanded.reshape(-1, state.n_dims)
         
         return State(points=result_pts)
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        scale_str = ", ".join(f"{v:.1f}" for v in np.atleast_1d(self.scale)[:3])
+        return f"K({scale_str})"
+    
+    @property
+    def category(self):
+        from ..base import OperatorCategory
+        return OperatorCategory.SURJECTION
+    
+    @property
+    def preserves_mass(self) -> bool:
+        return False
 
 
 @dataclass
@@ -216,6 +231,21 @@ class ReplicationOperator(Operator):
         result_points = Y.reshape(-1, state.n_dims)
         
         return State(result_points)
+    
+    # === Algebraic Methods ===
+    
+    def to_symbolic(self) -> str:
+        k = len(self.kernel)
+        return f"⊕({k})"
+    
+    @property
+    def category(self):
+        from ..base import OperatorCategory
+        return OperatorCategory.SURJECTION
+    
+    @property
+    def preserves_mass(self) -> bool:
+        return False
 
 
 @dataclass
